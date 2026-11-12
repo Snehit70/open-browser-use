@@ -1760,3 +1760,117 @@ func TestChromeProfileDirsIncludesCustomNamedProfilesFromLocalState(t *testing.T
 		t.Fatalf("profile dirs = %v, want %v", got, want)
 	}
 }
+
+// fakeExtensionSocket serves one JSON-RPC request per connection, recording each
+// request and answering with respond(method, callIndex).
+func fakeExtensionSocket(t *testing.T, respond func(method string, params map[string]any, call int) map[string]any) (string, *[]map[string]any) {
+	t.Helper()
+	socketDir, err := os.MkdirTemp("/tmp", "obu-cdp-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketPath := filepath.Join(socketDir, "obu.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	var requests []map[string]any
+	go func() {
+		for call := 0; ; call++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			var request map[string]any
+			if err := wire.ReadJSON(conn, &request); err == nil {
+				requests = append(requests, request)
+				method, _ := request["method"].(string)
+				params, _ := request["params"].(map[string]any)
+				reply := respond(method, params, call)
+				reply["jsonrpc"] = "2.0"
+				reply["id"] = request["id"]
+				_ = wire.WriteJSON(conn, reply)
+			}
+			_ = conn.Close()
+		}
+	}()
+	return socketPath, &requests
+}
+
+func TestCdpReattachesOnceWhenDebuggerUnattached(t *testing.T) {
+	executeCalls := 0
+	socketPath, requests := fakeExtensionSocket(t, func(method string, _ map[string]any, _ int) map[string]any {
+		if method == "executeCdp" {
+			executeCalls++
+			if executeCalls == 1 {
+				return map[string]any{"error": map[string]any{"code": -32000, "message": "Debugger unattached"}}
+			}
+			return map[string]any{"result": map[string]any{"ok": true}}
+		}
+		return map[string]any{"result": nil}
+	})
+	paramsFile := filepath.Join(t.TempDir(), "params.json")
+	if err := os.WriteFile(paramsFile, []byte(`{"expression":"1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := run([]string{"cdp", "--socket", socketPath, "--session-id", "t", "--tab-id", "5",
+		"--timeout", "30s", "--method", "Runtime.evaluate", "--params", "@" + paramsFile})
+	if err != nil {
+		t.Fatalf("cdp should succeed after re-attach, got %v", err)
+	}
+	var methods []string
+	for _, request := range *requests {
+		methods = append(methods, request["method"].(string))
+	}
+	if got := strings.Join(methods, ","); got != "attach,executeCdp,attach,executeCdp" {
+		t.Fatalf("unexpected call sequence %s", got)
+	}
+	params := (*requests)[1]["params"].(map[string]any)
+	if params["timeoutMs"] != float64(29500) {
+		t.Fatalf("expected --timeout forwarded as timeoutMs, got %v", params["timeoutMs"])
+	}
+	commandParams := params["commandParams"].(map[string]any)
+	if commandParams["expression"] != "1" {
+		t.Fatalf("expected params read from file, got %v", commandParams)
+	}
+}
+
+func TestCdpFailsWithAttachErrorAndNonZeroOnRPCError(t *testing.T) {
+	socketPath, _ := fakeExtensionSocket(t, func(method string, _ map[string]any, _ int) map[string]any {
+		if method == "attach" {
+			return map[string]any{"error": map[string]any{"code": -32000, "message": "Cannot access a chrome:// URL"}}
+		}
+		return map[string]any{"result": nil}
+	})
+	err := run([]string{"cdp", "--socket", socketPath, "--session-id", "t", "--tab-id", "5", "--method", "Runtime.evaluate"})
+	if err == nil || !strings.Contains(err.Error(), "Cannot access a chrome:// URL") {
+		t.Fatalf("expected attach error to surface, got %v", err)
+	}
+
+	socketPath, _ = fakeExtensionSocket(t, func(string, map[string]any, int) map[string]any {
+		return map[string]any{"error": map[string]any{"code": -32601, "message": "Unknown method"}}
+	})
+	err = run([]string{"call", "--socket", socketPath, "--session-id", "t", "--method", "nope"})
+	if err == nil || !strings.Contains(err.Error(), "Unknown method") {
+		t.Fatalf("expected JSON-RPC error to fail the command, got %v", err)
+	}
+}
+
+func TestReadParamsArg(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.json")
+	if err := os.WriteFile(path, []byte(`{"a":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for input, want := range map[string]string{`{"b":2}`: `{"b":2}`, "@" + path: `{"a":1}`} {
+		got, err := readParamsArg(input, true)
+		if err != nil || string(got) != want {
+			t.Fatalf("readParamsArg(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	if _, err := readParamsArg("@/does/not/exist.json", true); err == nil {
+		t.Fatal("expected missing params file to fail")
+	}
+}

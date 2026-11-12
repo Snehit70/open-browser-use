@@ -1162,8 +1162,12 @@ func newCallCommand() *cobra.Command {
 			if method == "" {
 				return errors.New("call requires --method")
 			}
+			rawParams, err := readParamsArg(params, true)
+			if err != nil {
+				return fmt.Errorf("call --params: %w", err)
+			}
 			var paramValue map[string]any
-			if err := json.Unmarshal([]byte(params), &paramValue); err != nil {
+			if err := json.Unmarshal(rawParams, &paramValue); err != nil {
 				return err
 			}
 			return invokeAndWrite(options, method, paramValue)
@@ -1171,7 +1175,7 @@ func newCallCommand() *cobra.Command {
 	}
 	addSocketFlags(cmd, &options)
 	cmd.Flags().StringVar(&method, "method", "", "JSON-RPC method")
-	cmd.Flags().StringVar(&params, "params", "{}", "JSON object params")
+	cmd.Flags().StringVar(&params, "params", "{}", "JSON object params: inline JSON, @file.json, or - for stdin")
 	return cmd
 }
 
@@ -1340,26 +1344,53 @@ func newCdpCommand() *cobra.Command {
 			if method == "" {
 				return errors.New("cdp requires --method")
 			}
+			rawParams, err := readParamsArg(commandParamsJSON, true)
+			if err != nil {
+				return fmt.Errorf("cdp --params: %w", err)
+			}
 			var commandParams map[string]any
-			if err := json.Unmarshal([]byte(commandParamsJSON), &commandParams); err != nil {
+			if err := json.Unmarshal(rawParams, &commandParams); err != nil {
 				return fmt.Errorf("cdp --params must be a JSON object: %w", err)
 			}
 			target := map[string]any{}
 			if tabID > 0 {
 				target["tabId"] = tabID
-				_, _ = invokeWithOptions(options, "attach", map[string]any{"tabId": tabID})
+				if err := attachTab(options, tabID); err != nil {
+					return err
+				}
 			}
-			return invokeAndWrite(options, "executeCdp", map[string]any{
-				"target":        target,
-				"method":        method,
-				"commandParams": commandParams,
-			})
+			execute := func() (map[string]any, error) {
+				return invokeWithOptions(options, "executeCdp", map[string]any{
+					"target":        target,
+					"method":        method,
+					"commandParams": commandParams,
+					"timeoutMs":     cdpTimeoutMs(options.timeout),
+				})
+			}
+			response, err := execute()
+			if err != nil {
+				return err
+			}
+			// Chrome can drop the debugger between our attach and the command
+			// (navigations, reloads). Re-attach once and retry.
+			if tabID > 0 && isDebuggerUnattached(rpcError(response)) {
+				if err := attachTab(options, tabID); err != nil {
+					return fmt.Errorf("debugger detached and re-attach failed: %w", err)
+				}
+				if response, err = execute(); err != nil {
+					return err
+				}
+			}
+			if err := writeJSON(response); err != nil {
+				return err
+			}
+			return rpcError(response)
 		},
 	}
 	addSocketFlags(cmd, &options)
 	cmd.Flags().IntVar(&tabID, "tab-id", 0, "optional tab id target")
 	cmd.Flags().StringVar(&method, "method", "", "Chrome DevTools Protocol method")
-	cmd.Flags().StringVar(&commandParamsJSON, "params", "{}", "Chrome DevTools Protocol command params")
+	cmd.Flags().StringVar(&commandParamsJSON, "params", "{}", "Chrome DevTools Protocol command params: inline JSON, @file.json, or - for stdin")
 	return cmd
 }
 
@@ -1461,7 +1492,9 @@ func newOpenTabCommand() *cobra.Command {
 			}
 			output := map[string]any{"tab": result}
 			if url != "" {
-				_, _ = invokeWithOptions(options, "attach", map[string]any{"tabId": tabID})
+				if err := attachTab(options, tabID); err != nil {
+					return err
+				}
 				navigateResponse, err := invokeWithOptions(options, "executeCdp", map[string]any{
 					"target":        map[string]any{"tabId": tabID},
 					"method":        "Page.navigate",
@@ -1495,7 +1528,9 @@ func newNavigateCommand() *cobra.Command {
 			if url == "" {
 				return errors.New("navigate requires --url")
 			}
-			_, _ = invokeWithOptions(options, "attach", map[string]any{"tabId": tabID})
+			if err := attachTab(options, tabID); err != nil {
+				return err
+			}
 			return invokeAndWrite(options, "executeCdp", map[string]any{
 				"target":        map[string]any{"tabId": tabID},
 				"method":        "Page.navigate",
@@ -2037,8 +2072,12 @@ func (runner *actionRunner) runCDPAction(args []string) (map[string]any, int, er
 	if paramsJSON == "" {
 		paramsJSON = "{}"
 	}
+	rawParams, err := readParamsArg(paramsJSON, false)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cdp params: %w", err)
+	}
 	var commandParams map[string]any
-	if err := json.Unmarshal([]byte(paramsJSON), &commandParams); err != nil {
+	if err := json.Unmarshal(rawParams, &commandParams); err != nil {
 		return nil, 0, fmt.Errorf("cdp params must be a JSON object: %w", err)
 	}
 	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
@@ -2048,11 +2087,22 @@ func (runner *actionRunner) runCDPAction(args []string) (map[string]any, int, er
 	if err := runner.attach(tabID); err != nil {
 		return nil, 0, err
 	}
-	return runner.invoke("executeCdp", map[string]any{
-		"target":        map[string]any{"tabId": tabID},
-		"method":        method,
-		"commandParams": commandParams,
-	})
+	execute := func() (map[string]any, int, error) {
+		return runner.invoke("executeCdp", map[string]any{
+			"target":        map[string]any{"tabId": tabID},
+			"method":        method,
+			"commandParams": commandParams,
+			"timeoutMs":     cdpTimeoutMs(runner.options.timeout),
+		})
+	}
+	response, currentTabID, err := execute()
+	if err == nil && isDebuggerUnattached(rpcError(response)) {
+		if err := runner.attach(tabID); err != nil {
+			return nil, 0, fmt.Errorf("debugger detached and re-attach failed: %w", err)
+		}
+		return execute()
+	}
+	return response, currentTabID, err
 }
 
 func (runner *actionRunner) runHistoryAction(args []string) (map[string]any, int, error) {
@@ -2143,16 +2193,26 @@ func (runner *actionRunner) runCallAction(args []string) (map[string]any, int, e
 	if paramsJSON == "" {
 		paramsJSON = "{}"
 	}
+	rawParams, err := readParamsArg(paramsJSON, false)
+	if err != nil {
+		return nil, 0, fmt.Errorf("call params: %w", err)
+	}
 	var params map[string]any
-	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
+	if err := json.Unmarshal(rawParams, &params); err != nil {
 		return nil, 0, fmt.Errorf("call params must be a JSON object: %w", err)
 	}
 	return runner.invoke(method, params)
 }
 
 func (runner *actionRunner) attach(tabID int) error {
-	_, _, err := runner.invoke("attach", map[string]any{"tabId": tabID})
-	return err
+	response, _, err := runner.invoke("attach", map[string]any{"tabId": tabID})
+	if err != nil {
+		return err
+	}
+	if err := rpcError(response); err != nil {
+		return fmt.Errorf("attach debugger to tab %d: %w", tabID, err)
+	}
+	return nil
 }
 
 func (runner *actionRunner) invoke(method string, params map[string]any) (map[string]any, int, error) {
@@ -2333,12 +2393,74 @@ func runtimeEvaluateString(response map[string]any) string {
 	return value
 }
 
+// invokeAndWrite prints the full JSON-RPC response and, when it carries an
+// error, also returns that error so the CLI exits non-zero. Scripts and agents
+// can then rely on the exit code instead of parsing every response.
 func invokeAndWrite(options socketOptions, method string, params map[string]any) error {
 	response, err := invokeWithOptions(options, method, params)
 	if err != nil {
 		return err
 	}
-	return writeJSON(response)
+	if err := writeJSON(response); err != nil {
+		return err
+	}
+	return rpcError(response)
+}
+
+// rpcError returns the JSON-RPC error carried by response, or nil.
+func rpcError(response map[string]any) error {
+	raw, ok := response["error"]
+	if !ok || raw == nil {
+		return nil
+	}
+	if payload, ok := raw.(map[string]any); ok {
+		if message, ok := payload["message"].(string); ok && message != "" {
+			return errors.New(message)
+		}
+	}
+	return fmt.Errorf("%v", raw)
+}
+
+func isDebuggerUnattached(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Debugger unattached")
+}
+
+// attachTab attaches the debugger to tabID and reports why it failed, instead
+// of leaving the next CDP call to fail with a bare "Debugger unattached".
+func attachTab(options socketOptions, tabID int) error {
+	response, err := invokeWithOptions(options, "attach", map[string]any{"tabId": tabID})
+	if err != nil {
+		return err
+	}
+	if err := rpcError(response); err != nil {
+		return fmt.Errorf("attach debugger to tab %d: %w", tabID, err)
+	}
+	return nil
+}
+
+// readParamsArg resolves a --params value: inline JSON, "@path" to read a
+// file, or "-" to read stdin. Files and stdin avoid the OS argument size limit
+// (128 KiB per argument on Linux) for large payloads such as uploads.
+func readParamsArg(value string, allowStdin bool) ([]byte, error) {
+	switch {
+	case value == "-" && allowStdin:
+		return io.ReadAll(os.Stdin)
+	case strings.HasPrefix(value, "@"):
+		return os.ReadFile(strings.TrimPrefix(value, "@"))
+	default:
+		return []byte(value), nil
+	}
+}
+
+// cdpTimeoutMs is the per-command timeout sent to the extension. It is a little
+// shorter than the socket deadline so the extension's timeout error arrives
+// before the connection is cut.
+func cdpTimeoutMs(timeout time.Duration) int {
+	const grace = 500 * time.Millisecond
+	if timeout > 2*grace {
+		timeout -= grace
+	}
+	return int(timeout.Milliseconds())
 }
 
 func invokeWithOptions(options socketOptions, method string, params map[string]any) (map[string]any, error) {
