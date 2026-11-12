@@ -441,6 +441,9 @@ class BrowserBackend {
         throw new Error(`Tab ${tabId} is already part of browser session ${owner.sessionId}`);
       }
     }
+    // Forget any earlier attachment record so the next command re-attaches
+    // against the tab's current state instead of trusting a stale entry.
+    this.attachedTabs.delete(tab.id);
     await this.ensureSessionGroup(session.sessionId, tab.id, "user");
     await this.setSessionActiveTab(session.sessionId, tab.id);
     return { ...toBrowserTab(tab), active: true };
@@ -545,16 +548,28 @@ class BrowserBackend {
   async attach(params) {
     await this.requireSessionTab(params, "attach");
     const tabId = requireTabId(params, "attach");
-    if (!this.attachedTabs.has(tabId)) {
-      try {
-        await chrome.debugger.attach({ tabId }, "1.3");
-      } catch (error) {
-        if (!String(error?.message ?? error).includes("Another debugger")) {
-          throw error;
-        }
-      }
-      this.attachedTabs.add(tabId);
+    await this.ensureAttached(tabId);
+  }
+
+  // Attach the debugger unless this tab is already tracked as attached. Chrome
+  // drops the attachment on some navigations and reloads, and the service worker
+  // forgets attachedTabs when it restarts, so callers re-check right before each
+  // command instead of trusting state from an earlier call.
+  async ensureAttached(tabId) {
+    if (this.attachedTabs.has(tabId)) {
+      return;
     }
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+    } catch (error) {
+      // Our own attachment can outlive a service worker restart; Chrome then
+      // reports it as "Another debugger". A real foreign debugger surfaces on
+      // the next sendCommand instead.
+      if (!String(error?.message ?? error).includes("Another debugger")) {
+        throw error;
+      }
+    }
+    this.attachedTabs.add(tabId);
   }
 
   async detach(params) {
@@ -569,9 +584,7 @@ class BrowserBackend {
     const tabId = target.tabId;
     if (typeof tabId === "number") {
       await this.requireSessionTab({ ...params, tabId }, "executeCdp");
-      if (!this.attachedTabs.has(tabId)) {
-        throw new Error("Debugger unattached");
-      }
+      await this.ensureAttached(tabId);
     }
     const timeoutMs =
       typeof params.timeoutMs === "number" && params.timeoutMs > 0
@@ -584,7 +597,20 @@ class BrowserBackend {
       if (typeof params.method !== "string") {
         throw new Error("executeCdp requires method");
       }
-      return await chrome.debugger.sendCommand(target, params.method, params.commandParams ?? {});
+      const commandParams = params.commandParams ?? {};
+      try {
+        return await chrome.debugger.sendCommand(target, params.method, commandParams);
+      } catch (error) {
+        // "not attached" means the command never ran, so re-attaching and
+        // retrying once is safe. "Detached while handling command" is not
+        // retried: the command (e.g. a submit click) may already have run.
+        if (typeof tabId !== "number" || !isDebuggerNotAttachedError(error)) {
+          throw error;
+        }
+        this.attachedTabs.delete(tabId);
+        await this.ensureAttached(tabId);
+        return await chrome.debugger.sendCommand(target, params.method, commandParams);
+      }
     });
   }
 
@@ -1498,6 +1524,12 @@ function downloadStatus(delta) {
 
 function cursorArrivalKey(sessionId, turnId, moveSequence) {
   return `${sessionId}:${turnId}:${moveSequence}`;
+}
+
+// Chrome reports "Debugger is not attached to the tab with id: N." when the
+// attachment is gone before a command is sent.
+function isDebuggerNotAttachedError(error) {
+  return /is not attached/i.test(String(error?.message ?? error));
 }
 
 async function withTimeout(timeoutMs, fn) {
