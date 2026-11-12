@@ -962,13 +962,18 @@ func chromeProfileDirs(root string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Chromium forks (Helium, Brave, Vivaldi, ...) and `--profile-directory`
+	// allow arbitrary profile directory names, so trust the profiles registered
+	// in Local State in addition to the stock "Default" / "Profile N" names.
+	registered := chromeProfileDisplayNames(root)
 	profiles := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if name == "Default" || strings.HasPrefix(name, "Profile ") {
+		_, known := registered[name]
+		if known || name == "Default" || strings.HasPrefix(name, "Profile ") {
 			profiles = append(profiles, filepath.Join(root, name))
 		}
 	}

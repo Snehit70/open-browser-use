@@ -1736,3 +1736,27 @@ func readManifestFromZIP(path string) ([]byte, error) {
 	}
 	return nil, errors.New("manifest.json not found in ZIP")
 }
+
+func TestChromeProfileDirsIncludesCustomNamedProfilesFromLocalState(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"Default", "Profile 3", "college", "System Profile", "Guest Profile", "Crashpad"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLocalStateAtRoot(t, root, `{"profile":{"info_cache":{"Default":{"name":"personal"},"Profile 3":{"name":"other"},"college":{"name":"college"}}}}`)
+
+	dirs, err := chromeProfileDirs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		got = append(got, filepath.Base(dir))
+	}
+	sort.Strings(got)
+	want := []string{"Default", "Profile 3", "college"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("profile dirs = %v, want %v", got, want)
+	}
+}
