@@ -1665,7 +1665,7 @@ func newScrollCommand() *cobra.Command {
 			var selector string
 			cmd.Flags().IntVar(&times, "times", 1, "number of wheel steps")
 			cmd.Flags().IntVar(&pixels, "pixels", 2000, "pixels per step (negative scrolls up)")
-			cmd.Flags().IntVar(&waitMs, "wait-ms", 1500, "pause after each step for content to load")
+			cmd.Flags().IntVar(&waitMs, "wait-ms", 1500, "pause after each step for content to load; 0 means none, but background tabs render slowly, so keep it near the default")
 			cmd.Flags().StringVar(&selector, "selector", "", "CSS selector of feed items to count, e.g. article")
 			cmd.Flags().IntVar(&until, "until-count", 0, "stop once --selector matches at least this many items")
 			return func() []string {
@@ -2416,15 +2416,36 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 
 const clickSettleDelay = 1200 * time.Millisecond
 
+// scrollChainJS returns the elements a wheel at the viewport center could
+// scroll: the page, body, and the composed-tree ancestors of the element
+// there, descending into open shadow roots. opaque is set when that element
+// is a frame or plugin whose own scrolling the top document cannot see.
+const scrollChainJS = `(() => {
+  const x = innerWidth / 2, y = innerHeight / 2;
+  const page = document.scrollingElement || document.documentElement;
+  const chain = new Set([page, document.body]);
+  let el = document.elementFromPoint(x, y);
+  while (el && el.shadowRoot) {
+    const inner = el.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  const opaque = !!el && /^(IFRAME|FRAME|OBJECT|EMBED)$/.test(el.tagName);
+  while (el) {
+    chain.add(el);
+    const root = el.getRootNode();
+    el = el.assignedSlot || el.parentElement || (root instanceof ShadowRoot ? root.host : null);
+  }
+  return { page, chain, opaque };
+})`
+
 // scrollStateScript snapshots every scrollable element that a wheel at the
 // viewport center could move (the ancestors of the element there, plus body
 // and the page), so the CLI can tell whether a wheel step moved anything.
 // Element ids live in a page-side WeakMap so they stay stable across calls.
 const scrollStateScript = `((selector) => {
   const reg = (window.__obuScroll ??= { ids: new WeakMap(), next: 0 });
-  const page = document.scrollingElement || document.documentElement;
-  const chain = new Set([page, document.body]);
-  for (let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2); el; el = el.parentElement) chain.add(el);
+  const { page, chain, opaque } = ` + scrollChainJS + `();
   const positions = {}, labels = {};
   let height = 0;
   for (const el of chain) {
@@ -2436,7 +2457,7 @@ const scrollStateScript = `((selector) => {
     height += el.scrollHeight;
   }
   return {
-    positions, labels, height, visibilityState: document.visibilityState,
+    positions, labels, height, opaque, visibilityState: document.visibilityState,
     viewport: [innerWidth, innerHeight],
     ...(selector ? { count: document.querySelectorAll(selector).length } : {})
   };
@@ -2448,9 +2469,7 @@ const scrollStateScript = `((selector) => {
 // center lands on a nested box that has reached its end and swallows the
 // event. Returns whether it found something to scroll.
 const scrollNudgeScript = `((dy) => {
-  const page = document.scrollingElement || document.documentElement;
-  const chain = new Set([page, document.body]);
-  for (let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2); el; el = el.parentElement) chain.add(el);
+  const { page, chain } = ` + scrollChainJS + `();
   let best = null;
   for (const el of chain) {
     if (!el) continue;
@@ -2484,6 +2503,9 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 	pixels, ok := intFlag(args, "--pixels")
 	if !ok {
 		pixels = 2000
+	}
+	if pixels == 0 {
+		return nil, 0, errors.New("scroll --pixels must not be 0 (negative scrolls up)")
 	}
 	waitMs, ok := intFlag(args, "--wait-ms")
 	if !ok || waitMs < 0 {
@@ -2585,6 +2607,7 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		return nudged, nil
 	}
 	input := "wheel"
+	blind := false
 	stopped := "times"
 	previous, after := before, before
 	steps := 0
@@ -2608,6 +2631,11 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 			return nil, 0, err
 		}
 		progressed := track(previous, after) || grew(previous, after)
+		if !progressed && after["opaque"] == true {
+			// The wheel lands in a frame or plugin the top document cannot
+			// measure; keep going blind rather than calling it the end.
+			blind, progressed = true, true
+		}
 		if !progressed {
 			// Background tabs render slowly; give the wheel and any lazy
 			// loader a longer second beat before deciding nothing happened.
@@ -2617,7 +2645,7 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 			}
 			progressed = track(previous, after) || grew(previous, after)
 		}
-		if !progressed && input == "wheel" && pixels != 0 {
+		if !progressed && input == "wheel" {
 			// The wheel went nowhere, typically into a nested box at its end.
 			nudged, err := nudge(pixels)
 			if err != nil {
@@ -2674,6 +2702,9 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		return out
 	}
 	result := map[string]any{"steps": steps, "stopped": stopped, "input": input, "before": summary(before), "after": summary(after)}
+	if blind {
+		result["warning"] = "the center of the tab is an iframe or plugin that scroll cannot measure, so it ran without detecting the end; check the result with page-info or a screenshot, or scroll inside the frame with cdp"
+	}
 	if scroller != "" {
 		result["scroller"] = scroller
 		result["scrolledPx"] = int(scrolled)

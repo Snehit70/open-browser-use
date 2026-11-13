@@ -160,6 +160,19 @@ async function run() {
     // record must land before attach decides on focus emulation.
     await cdp(backend, 6, "Runtime.evaluate");
     assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "a link-spawned tab gets focus emulation");
+    // Two commands racing on a fresh spawned tab: the second must not run
+    // before the first finished setting the tab up.
+    state.tabs.set(7, { id: 7, groupId: 9, windowId: 1, openerTabId: 1, url: "https://spawned2.test/" });
+    state.onCreated(state.tabs.get(7));
+    state.targets.length = 0;
+    const first = cdp(backend, 7, "Runtime.evaluate");
+    await new Promise((resolve) => setTimeout(resolve, 10)); // first is mid-setup (spawn lookup takes 30ms)
+    await Promise.all([first, cdp(backend, 7, "DOM.enable")]);
+    const order = state.targets.filter((t) => t.tabId === 7).map((t) => t.method);
+    assert.ok(
+      order.indexOf("Emulation.setFocusEmulationEnabled") < order.indexOf("DOM.enable"),
+      `setup runs before a parallel command: ${order.join(", ")}`
+    );
     const tabs = await backend.getTabs({ session_id: "s1", turn_id: "t" });
     assert.equal(tabs.find((tab) => tab.id === 6)?.origin, "agent", "getTabs reports tab origin");
     console.log("test 1b ok: spawned tabs are known as agent tabs before first attach; getTabs reports origin");

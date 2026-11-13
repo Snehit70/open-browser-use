@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -133,15 +136,46 @@ func TestScrollUpStopsAtTop(t *testing.T) {
 	}
 }
 
-func TestScrollZeroPixelsIsHonoured(t *testing.T) {
-	socketPath, deltas, _ := scrollFake(t, "agent", func(int) map[string]any {
-		return page(map[string]any{"1": 0.0}, 9000)
-	})
-	if err := run(scrollArgs(socketPath, "--pixels", "0", "--times", "3")); err != nil {
+func TestScrollRejectsZeroPixels(t *testing.T) {
+	socketPath, deltas, _ := scrollFake(t, "agent", func(int) map[string]any { return page(map[string]any{"1": 0.0}, 9000) })
+	if err := run(scrollArgs(socketPath, "--pixels", "0")); err == nil {
+		t.Fatal("--pixels 0 should be rejected")
+	}
+	if len(*deltas) != 0 {
+		t.Fatalf("no wheel should be sent, got %v", *deltas)
+	}
+}
+
+// When the center of the tab is an iframe, nothing measurable moves; scroll
+// must keep going (as before this change) rather than report the end.
+func TestScrollKeepsGoingOverOpaqueFrame(t *testing.T) {
+	nudges := 0
+	socketPath, deltas, _ := scrollFakeWithNudge(t, "agent", func(int) map[string]any {
+		s := page(map[string]any{"1": 0.0}, 900)
+		s["opaque"] = true
+		return s
+	}, func(int) bool { nudges++; return true })
+	if err := run(scrollArgs(socketPath, "--times", "4")); err != nil {
 		t.Fatal(err)
 	}
-	if len(*deltas) != 1 || (*deltas)[0] != 0 {
-		t.Fatalf("--pixels 0 should send deltaY 0 and stop, got %v", *deltas)
+	if len(*deltas) != 4 || nudges != 0 {
+		t.Fatalf("want 4 wheels and no scrollBy fallback, got %d wheels, %d nudges", len(*deltas), nudges)
+	}
+}
+
+// The page scripts are only exercised in a browser; at least make sure they parse.
+func TestScrollScriptsParse(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	path := filepath.Join(t.TempDir(), "scripts.js")
+	source := "const a = " + scrollStateScript + ";\nconst b = " + scrollNudgeScript + ";\n"
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
+		t.Fatalf("page scripts do not parse: %v\n%s", err, out)
 	}
 }
 

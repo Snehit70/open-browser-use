@@ -318,6 +318,7 @@ class BrowserBackend {
     // which Runtime.evaluate on the tab cannot see.
     this.framesByTabId = new Map();
     this.pendingSpawns = new Map();
+    this.attachSetups = new Map();
     this.nextCursorMoveSequence = 1;
     chrome.debugger.onDetach.addListener((source) => {
       if (typeof source.tabId === "number") {
@@ -603,6 +604,8 @@ class BrowserBackend {
   // command instead of trusting state from an earlier call.
   async ensureAttached(tabId) {
     if (this.attachedTabs.has(tabId)) {
+      // Another caller may still be setting the tab up; run after it.
+      await this.attachSetups.get(tabId);
       return;
     }
     try {
@@ -616,7 +619,17 @@ class BrowserBackend {
       }
     }
     this.attachedTabs.add(tabId);
-    await this.pendingSpawns?.get(tabId);
+    const setup = this.setUpAttachedTab(tabId);
+    this.attachSetups.set(tabId, setup);
+    try {
+      await setup;
+    } finally {
+      if (this.attachSetups.get(tabId) === setup) this.attachSetups.delete(tabId);
+    }
+  }
+
+  async setUpAttachedTab(tabId) {
+    await this.pendingSpawns.get(tabId);
     // Page events are off until Page.enable; without them a JavaScript dialog
     // is invisible and every later command just times out.
     await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
