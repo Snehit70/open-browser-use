@@ -99,6 +99,7 @@ func newRootCommand() *cobra.Command {
 		newPageInfoCommand(),
 		newFramesCommand(),
 		newClickCommand(),
+		newScrollCommand(),
 		newSimpleRPCCommand("ping", "ping", "Ping the browser backend"),
 		newSimpleRPCCommand("info", "getInfo", "Print browser backend info"),
 		newSimpleRPCCommand("tabs", "getTabs", "List session tabs"),
@@ -1656,6 +1657,26 @@ func newClickCommand() *cobra.Command {
 		})
 }
 
+func newScrollCommand() *cobra.Command {
+	return newRunnerTabCommand("scroll", "Scroll with real wheel input so infinite feeds load, even in a background tab", (*actionRunner).runScrollAction,
+		func(cmd *cobra.Command) func() []string {
+			var times, pixels, waitMs, until int
+			var selector string
+			cmd.Flags().IntVar(&times, "times", 1, "number of wheel steps")
+			cmd.Flags().IntVar(&pixels, "pixels", 2000, "pixels per step (negative scrolls up)")
+			cmd.Flags().IntVar(&waitMs, "wait-ms", 1500, "pause after each step for content to load")
+			cmd.Flags().StringVar(&selector, "selector", "", "CSS selector of feed items to count, e.g. article")
+			cmd.Flags().IntVar(&until, "until-count", 0, "stop once --selector matches at least this many items")
+			return func() []string {
+				out := []string{"--times", strconv.Itoa(times), "--pixels", strconv.Itoa(pixels), "--wait-ms", strconv.Itoa(waitMs), "--until-count", strconv.Itoa(until)}
+				if selector != "" {
+					out = append(out, "--selector", selector)
+				}
+				return out
+			}
+		})
+}
+
 func newFramesCommand() *cobra.Command {
 	return newRunnerTabCommand("frames", "List a session tab's cross-origin iframes for cdp/page-info --frame", (*actionRunner).runFramesAction, nil)
 }
@@ -2125,6 +2146,8 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 		return runner.runFramesAction(args)
 	case "click":
 		return runner.runClickAction(args)
+	case "scroll":
+		return runner.runScrollAction(args)
 	case "cdp":
 		return runner.runCDPAction(args)
 	case "history":
@@ -2383,6 +2406,119 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 
 const clickSettleDelay = 1200 * time.Millisecond
 
+// scrollStateScript reports the scroll position, visibility, and (with a
+// selector) how many matching items the page has rendered so far.
+const scrollStateScript = `((selector) => ({
+  scrollY: Math.round(window.scrollY),
+  atBottom: window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2,
+  visibilityState: document.visibilityState,
+  viewport: [window.innerWidth, window.innerHeight],
+  ...(selector ? { count: document.querySelectorAll(selector).length } : {})
+}))`
+
+// runScrollAction scrolls with real mouse-wheel input so infinite feeds and
+// lazy loaders fire. It turns on focus emulation first: without it a
+// background tab reports itself hidden and many pages never load more.
+func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int, error) {
+	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
+	if err != nil {
+		return nil, 0, err
+	}
+	times, _ := intFlag(args, "--times")
+	if times < 1 {
+		times = 1
+	}
+	pixels, _ := intFlag(args, "--pixels")
+	if pixels == 0 {
+		pixels = 2000
+	}
+	waitMs, _ := intFlag(args, "--wait-ms")
+	if waitMs <= 0 {
+		waitMs = 1500
+	}
+	selector := stringFlag(args, "--selector")
+	until, _ := intFlag(args, "--until-count")
+	if until > 0 && selector == "" {
+		return nil, 0, errors.New("scroll --until-count needs --selector to count items")
+	}
+	if err := runner.attach(tabID); err != nil {
+		return nil, 0, err
+	}
+	cdp := func(method string, params map[string]any) (map[string]any, error) {
+		response, _, err := runner.invoke("executeCdp", map[string]any{
+			"target": tabTarget(tabID, ""), "method": method, "commandParams": params,
+			"timeoutMs": cdpTimeoutMs(runner.options.timeout),
+		})
+		if err == nil {
+			err = rpcError(response)
+		}
+		return response, err
+	}
+	stateExpression := scrollStateScript + "(" + strconv.Quote(selector) + ")"
+	state := func() (map[string]any, error) {
+		response, err := cdp("Runtime.evaluate", map[string]any{"expression": stateExpression, "returnByValue": true})
+		if err != nil {
+			return nil, err
+		}
+		result, _ := response["result"].(map[string]any)
+		inner, _ := result["result"].(map[string]any)
+		value, _ := inner["value"].(map[string]any)
+		if value == nil {
+			return nil, fmt.Errorf("scroll: could not read page state: %v", result)
+		}
+		return value, nil
+	}
+	if _, err := cdp("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}); err != nil {
+		return nil, 0, err
+	}
+	before, err := state()
+	if err != nil {
+		return nil, 0, err
+	}
+	x, y := 400.0, 300.0
+	if viewport, ok := before["viewport"].([]any); ok && len(viewport) == 2 {
+		if w, ok := viewport[0].(float64); ok {
+			x = w / 2
+		}
+		if h, ok := viewport[1].(float64); ok {
+			y = h / 2
+		}
+	}
+	after := before
+	steps := 0
+	for steps < times {
+		if until > 0 {
+			if count, ok := numberAsInt(after["count"]); ok && count >= until {
+				break
+			}
+		}
+		if _, err := cdp("Input.dispatchMouseEvent", map[string]any{
+			"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": pixels,
+		}); err != nil {
+			return nil, 0, err
+		}
+		steps++
+		time.Sleep(time.Duration(waitMs) * time.Millisecond)
+		if after, err = state(); err != nil {
+			return nil, 0, err
+		}
+		if pixels > 0 && after["atBottom"] == true && until == 0 && steps < times {
+			// Give a lazy loader one more beat, then stop if nothing grew.
+			time.Sleep(time.Duration(waitMs) * time.Millisecond)
+			if again, err := state(); err == nil {
+				if again["atBottom"] == true {
+					after = again
+					break
+				}
+				after = again
+			}
+		}
+	}
+	delete(before, "viewport")
+	delete(after, "viewport")
+	return map[string]any{"result": map[string]any{"steps": steps, "before": before, "after": after}}, tabID, nil
+}
+
 func (runner *actionRunner) sessionTabIDs() []int {
 	response, _, err := runner.invoke("getTabs", map[string]any{})
 	if err != nil {
@@ -2435,7 +2571,7 @@ func (runner *actionRunner) runPageInfoAction(args []string) (map[string]any, in
 		"target": tabTarget(tabID, stringFlag(args, "--frame")),
 		"method": "Runtime.evaluate",
 		"commandParams": map[string]any{
-			"expression":    `({ title: document.title ?? "", url: location.href, readyState: document.readyState, text: document.body?.innerText ?? "" })`,
+			"expression":    `({ title: document.title ?? "", url: location.href, readyState: document.readyState, visibilityState: document.visibilityState, text: document.body?.innerText ?? "" })`,
 			"returnByValue": true,
 		},
 	})

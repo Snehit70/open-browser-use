@@ -136,7 +136,7 @@ async function run() {
     const result = await cdp(backend, 7, "Page.captureScreenshot");
     assert.deepEqual(result, { ok: "Page.captureScreenshot" });
     // Re-attaching also re-enables Page events (dialogs) and iframe auto-attach.
-    const setup = new Set(["Page.enable", "Target.setAutoAttach"]);
+    const setup = new Set(["Page.enable", "Emulation.setFocusEmulationEnabled", "Target.setAutoAttach"]);
     assert.deepEqual(
       state.sent.filter((method) => !setup.has(method)).slice(-2),
       ["Page.captureScreenshot", "Page.captureScreenshot"]

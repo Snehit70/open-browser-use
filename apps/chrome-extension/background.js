@@ -608,6 +608,10 @@ class BrowserBackend {
     // Page events are off until Page.enable; without them a JavaScript dialog
     // is invisible and every later command just times out.
     await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+    // Agent tabs are usually in the background, where pages see
+    // visibilityState "hidden" and lazy loaders and infinite scroll stall.
+    // Focus emulation makes the page behave as if it were the focused tab.
+    await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
     await this.enableFrameAttach({ tabId });
   }
 
