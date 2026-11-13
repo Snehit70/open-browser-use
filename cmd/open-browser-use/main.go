@@ -717,7 +717,17 @@ func detectCRXExtensionInProfile(profileDir string, extensionID string) (detecte
 }
 
 func detectUnpackedExtensionInProfile(profileDir string, extensionID string) (detectedExtension, bool) {
-	securePrefsPath := filepath.Join(profileDir, "Secure Preferences")
+	// Chromium keeps MAC-protected extension settings in Secure Preferences, but
+	// some builds (Helium among them) record unpacked extensions in Preferences.
+	for _, name := range []string{"Secure Preferences", "Preferences"} {
+		if detected, ok := detectExtensionInPrefsFile(profileDir, filepath.Join(profileDir, name), extensionID); ok {
+			return detected, true
+		}
+	}
+	return detectedExtension{}, false
+}
+
+func detectExtensionInPrefsFile(profileDir string, securePrefsPath string, extensionID string) (detectedExtension, bool) {
 	payload, err := os.ReadFile(securePrefsPath)
 	if err != nil {
 		return detectedExtension{}, false

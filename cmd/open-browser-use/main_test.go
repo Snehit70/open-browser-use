@@ -507,6 +507,11 @@ func writeChromeLocalState(t *testing.T, home string, payload string) {
 
 func writeChromeUnpackedExtension(t *testing.T, home, profileDir, extensionID, extensionVersion string) {
 	t.Helper()
+	writeChromeUnpackedExtensionIn(t, home, profileDir, "Secure Preferences", extensionID, extensionVersion)
+}
+
+func writeChromeUnpackedExtensionIn(t *testing.T, home, profileDir, prefsFile, extensionID, extensionVersion string) {
+	t.Helper()
 	base := filepath.Join(home, "Library/Application Support/Google/Chrome")
 	if runtime.GOOS == "linux" {
 		base = filepath.Join(home, ".config/google-chrome")
@@ -536,7 +541,7 @@ func writeChromeUnpackedExtension(t *testing.T, home, profileDir, extensionID, e
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(profileRoot, "Secure Preferences"), payload, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(profileRoot, prefsFile), payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -566,6 +571,25 @@ func TestListInstalledChromeProfilesDetectsUnpackedExtension(t *testing.T) {
 	}
 	if profiles[0].Version != "0.1.29" {
 		t.Errorf("expected version 0.1.29, got %q", profiles[0].Version)
+	}
+}
+
+func TestListInstalledChromeProfilesDetectsUnpackedExtensionInPreferences(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Chrome profile detection is not implemented on windows")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Helium records unpacked extensions in Preferences, not Secure Preferences.
+	writeChromeUnpackedExtensionIn(t, home, "college", "Preferences", defaultChromeExtensionID, "1.1.0")
+	writeChromeLocalState(t, home, `{"profile":{"info_cache":{"college":{"name":"college"}}}}`)
+
+	profiles, err := listInstalledChromeProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0].Directory != "college" || profiles[0].Version != "1.1.0" {
+		t.Fatalf("expected college profile with version 1.1.0, got %+v", profiles)
 	}
 }
 
