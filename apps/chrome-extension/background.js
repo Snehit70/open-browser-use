@@ -611,8 +611,17 @@ class BrowserBackend {
     // Agent tabs are usually in the background, where pages see
     // visibilityState "hidden" and lazy loaders and infinite scroll stall.
     // Focus emulation makes the page behave as if it were the focused tab.
-    await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    // Only for tabs the agent opened: on a tab claimed from the user it would
+    // also mark chats read or keep media playing while the user is elsewhere.
+    if (this.isAgentTab(tabId)) {
+      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    }
     await this.enableFrameAttach({ tabId });
+  }
+
+  isAgentTab(tabId) {
+    const sessions = Object.values(this.store.state.sessions ?? {});
+    return sessions.some((session) => session.tabOrigins?.[String(tabId)] === "agent");
   }
 
   // Cross-site iframes run in their own renderer. Auto-attach (flatten) gives

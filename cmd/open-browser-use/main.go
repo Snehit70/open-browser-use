@@ -1809,21 +1809,30 @@ func supportedBrowserProfileRoots() ([]browserProfileRoot, error) {
 // directory. Some setups link ~/.config/google-chrome to another Chromium
 // browser's directory so Chrome-only native hosts work there; those profiles
 // belong to the real browser, not to Chrome.
+// When several roots resolve to one directory, the one that is not a symlink
+// wins; if all are symlinks, the earlier root in the list wins. Missing or
+// dangling roots are kept as-is.
 func dedupeAliasedRoots(roots []browserProfileRoot) []browserProfileRoot {
-	seen := map[string]bool{}
-	var out []browserProfileRoot
-	for _, root := range roots {
-		if info, err := os.Lstat(root.Root); err == nil && info.Mode()&os.ModeSymlink == 0 {
-			if resolved, err := filepath.EvalSymlinks(root.Root); err == nil {
-				seen[resolved] = true
-			}
+	owner := map[string]int{}
+	resolvedOf := make([]string, len(roots))
+	isLink := func(path string) bool {
+		info, err := os.Lstat(path)
+		return err == nil && info.Mode()&os.ModeSymlink != 0
+	}
+	for index, root := range roots {
+		resolved, err := filepath.EvalSymlinks(root.Root)
+		if err != nil {
+			continue
+		}
+		resolvedOf[index] = resolved
+		if current, ok := owner[resolved]; !ok || (isLink(roots[current].Root) && !isLink(root.Root)) {
+			owner[resolved] = index
 		}
 	}
-	for _, root := range roots {
-		if info, err := os.Lstat(root.Root); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			if resolved, err := filepath.EvalSymlinks(root.Root); err == nil && seen[resolved] {
-				continue
-			}
+	var out []browserProfileRoot
+	for index, root := range roots {
+		if resolved := resolvedOf[index]; resolved != "" && owner[resolved] != index {
+			continue
 		}
 		out = append(out, root)
 	}
@@ -2408,13 +2417,24 @@ const clickSettleDelay = 1200 * time.Millisecond
 
 // scrollStateScript reports the scroll position, visibility, and (with a
 // selector) how many matching items the page has rendered so far.
-const scrollStateScript = `((selector) => ({
-  scrollY: Math.round(window.scrollY),
-  atBottom: window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2,
-  visibilityState: document.visibilityState,
-  viewport: [window.innerWidth, window.innerHeight],
-  ...(selector ? { count: document.querySelectorAll(selector).length } : {})
-}))`
+// Many apps scroll an inner element rather than the page, so measure the
+// nearest scrollable ancestor of whatever sits at the viewport center.
+const scrollStateScript = `((selector) => {
+  const page = document.scrollingElement || document.documentElement;
+  const scrolls = (e) => e.scrollHeight > e.clientHeight + 1 && /(auto|scroll|overlay)/.test(getComputedStyle(e).overflowY);
+  let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+  while (el && el !== page && el !== document.body && !scrolls(el)) el = el.parentElement;
+  const scroller = el && el !== document.body && scrolls(el) ? el : page;
+  return {
+    scrollY: Math.round(scroller.scrollTop),
+    atBottom: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2,
+    atTop: scroller.scrollTop <= 0,
+    scroller: scroller === page ? "page" : scroller.tagName.toLowerCase() + (scroller.id ? "#" + scroller.id : ""),
+    visibilityState: document.visibilityState,
+    viewport: [innerWidth, innerHeight],
+    ...(selector ? { count: document.querySelectorAll(selector).length } : {})
+  };
+})`
 
 // runScrollAction scrolls with real mouse-wheel input so infinite feeds and
 // lazy loaders fire. It turns on focus emulation first: without it a
@@ -2428,12 +2448,12 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 	if times < 1 {
 		times = 1
 	}
-	pixels, _ := intFlag(args, "--pixels")
-	if pixels == 0 {
+	pixels, ok := intFlag(args, "--pixels")
+	if !ok {
 		pixels = 2000
 	}
-	waitMs, _ := intFlag(args, "--wait-ms")
-	if waitMs <= 0 {
+	waitMs, ok := intFlag(args, "--wait-ms")
+	if !ok || waitMs < 0 {
 		waitMs = 1500
 	}
 	selector := stringFlag(args, "--selector")
@@ -2502,15 +2522,18 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		if after, err = state(); err != nil {
 			return nil, 0, err
 		}
-		if pixels > 0 && after["atBottom"] == true && until == 0 && steps < times {
-			// Give a lazy loader one more beat, then stop if nothing grew.
+		edge := "atBottom"
+		if pixels < 0 {
+			edge = "atTop"
+		}
+		if after[edge] == true && steps < times {
+			// At the end: give a lazy loader one more beat, stop if nothing grew.
 			time.Sleep(time.Duration(waitMs) * time.Millisecond)
 			if again, err := state(); err == nil {
-				if again["atBottom"] == true {
-					after = again
+				after = again
+				if again[edge] == true {
 					break
 				}
-				after = again
 			}
 		}
 	}

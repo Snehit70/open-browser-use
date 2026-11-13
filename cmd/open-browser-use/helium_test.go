@@ -63,3 +63,48 @@ func TestSeparateChromeAndHeliumStayDistinct(t *testing.T) {
 		t.Fatalf("helium selector: %+v %v", root, err)
 	}
 }
+
+func TestBothDirsSymlinkedToOneTarget(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Helium detection is Linux-only")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	data := filepath.Join(home, "data/helium")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range []string{".config/net.imput.helium", ".config/google-chrome"} {
+		if err := os.Symlink(data, filepath.Join(home, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	roots, err := supportedBrowserProfileRoots()
+	if err != nil || len(roots) != 1 || roots[0].BrowserID != "helium" {
+		t.Fatalf("want one Helium root, got %+v (%v)", roots, err)
+	}
+	if _, err := defaultNativeHostManifestPathForBrowser(""); err != nil {
+		t.Fatalf("default install path must not be ambiguous: %v", err)
+	}
+}
+
+func TestDanglingChromeSymlinkKeepsBothRoots(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Helium detection is Linux-only")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(home, "gone"), filepath.Join(home, ".config/google-chrome")); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := supportedBrowserProfileRoots()
+	if err != nil || len(roots) != 2 {
+		t.Fatalf("want both roots kept, got %+v (%v)", roots, err)
+	}
+}

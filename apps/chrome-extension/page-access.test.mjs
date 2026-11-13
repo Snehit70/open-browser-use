@@ -138,7 +138,12 @@ async function run() {
     const { backend, state } = await loadBackend();
     await cdp(backend, 1, "Runtime.evaluate");
     assert.ok(state.sent.includes("Page.enable"), "attach enables Page events");
-    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "attach makes background tabs act focused");
+    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "attach makes agent tabs act focused");
+    backend.store.state.sessions.s1.tabOrigins[3] = "user";
+    state.tabs.get(3).groupId = 9;
+    state.sent.length = 0;
+    await cdp(backend, 3, "Runtime.evaluate");
+    assert.ok(!state.sent.includes("Emulation.setFocusEmulationEnabled"), "a tab claimed from the user keeps real focus state");
     backend.handleCdpEvent({ tabId: 1 }, "Page.javascriptDialogOpening", { type: "alert", message: "Hi there" });
     await assert.rejects(cdp(backend, 1, "Runtime.evaluate"), /blocked by a JavaScript alert dialog: "Hi there".*handleJavaScriptDialog/);
     await cdp(backend, 1, "Page.handleJavaScriptDialog");
