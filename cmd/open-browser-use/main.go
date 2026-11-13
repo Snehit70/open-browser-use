@@ -94,6 +94,8 @@ func newRootCommand() *cobra.Command {
 		newIabCommand(),
 		newOpenTabCommand(),
 		newNavigateCommand(),
+		newWaitLoadCommand(),
+		newPageInfoCommand(),
 		newSimpleRPCCommand("ping", "ping", "Ping the browser backend"),
 		newSimpleRPCCommand("info", "getInfo", "Print browser backend info"),
 		newSimpleRPCCommand("tabs", "getTabs", "List session tabs"),
@@ -1554,6 +1556,55 @@ func newNavigateCommand() *cobra.Command {
 	return cmd
 }
 
+// newRunnerTabCommand exposes a tab-scoped run-plan action (wait-load,
+// page-info) as a top-level command so agents don't need a one-line plan.
+func newRunnerTabCommand(use, short string, run func(*actionRunner, []string) (map[string]any, int, error), extra func(*cobra.Command) func() []string) *cobra.Command {
+	var options socketOptions
+	var tabID int
+	var extraArgs func() []string
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Args:  cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if tabID <= 0 {
+				return fmt.Errorf("%s requires --tab-id", use)
+			}
+			args := []string{"--tab-id", strconv.Itoa(tabID)}
+			if extraArgs != nil {
+				args = append(args, extraArgs()...)
+			}
+			response, _, err := run(newActionRunner(options), args)
+			if err != nil {
+				return err
+			}
+			if err := writeJSON(response); err != nil {
+				return err
+			}
+			return rpcError(response)
+		},
+	}
+	addSocketFlags(cmd, &options)
+	cmd.Flags().IntVar(&tabID, "tab-id", 0, "session tab id")
+	if extra != nil {
+		extraArgs = extra(cmd)
+	}
+	return cmd
+}
+
+func newWaitLoadCommand() *cobra.Command {
+	return newRunnerTabCommand("wait-load", "Wait until a session tab finishes loading", (*actionRunner).runWaitLoadAction,
+		func(cmd *cobra.Command) func() []string {
+			var state string
+			cmd.Flags().StringVar(&state, "state", "load", "load or domcontentloaded")
+			return func() []string { return []string{"--state", state} }
+		})
+}
+
+func newPageInfoCommand() *cobra.Command {
+	return newRunnerTabCommand("page-info", "Print a session tab's title, URL, ready state, and visible text", (*actionRunner).runPageInfoAction, nil)
+}
+
 func newVersionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -2031,6 +2082,7 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 		return nil, 0, err
 	}
 	deadline := time.Now().Add(runner.options.timeout)
+	var lastErr error
 	for {
 		response, _, err := runner.invoke("executeCdp", map[string]any{
 			"target": map[string]any{"tabId": tabID},
@@ -2047,8 +2099,19 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 		if readyState == "complete" || (state == "domcontentloaded" && readyState == "interactive") {
 			return map[string]any{"result": map[string]any{"readyState": readyState}}, tabID, nil
 		}
+		// Errors mid-navigation (destroyed contexts) are expected; keep polling
+		// but report the last one so a blocked page doesn't look like a slow one.
+		if rpcErr := rpcError(response); rpcErr != nil {
+			lastErr = rpcErr
+			if strings.Contains(rpcErr.Error(), "dialog") {
+				return nil, 0, rpcErr
+			}
+		}
 		if time.Now().After(deadline) {
-			return nil, 0, fmt.Errorf("timed out waiting for %s in tab %d", state, tabID)
+			if lastErr != nil {
+				return nil, 0, fmt.Errorf("timed out waiting for %s in tab %d (readyState %q; last error: %v)", state, tabID, readyState, lastErr)
+			}
+			return nil, 0, fmt.Errorf("timed out waiting for %s in tab %d (readyState %q)", state, tabID, readyState)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

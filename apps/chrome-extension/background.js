@@ -313,12 +313,37 @@ class BrowserBackend {
     this.cursorArrivalWaitersByKey = new Map();
     this.fileChoosersById = new Map();
     this.fileChooserWaitersByTabId = new Map();
+    this.dialogsByTabId = new Map();
     this.nextCursorMoveSequence = 1;
     chrome.debugger.onDetach.addListener((source) => {
       if (typeof source.tabId === "number") {
         this.attachedTabs.delete(source.tabId);
+        this.dialogsByTabId.delete(source.tabId);
       }
     });
+    // Links with target=_blank and window.open() in a session tab land in the
+    // session group with no recorded origin, so finalize would only ungroup
+    // them and leave them open. Record them as agent tabs.
+    chrome.tabs?.onCreated?.addListener((tab) => {
+      this.recordSpawnedTab(tab).catch(() => {});
+    });
+  }
+
+  async recordSpawnedTab(tab) {
+    if (!hasTabId(tab) || typeof tab.openerTabId !== "number") {
+      return;
+    }
+    await this.store.ready;
+    const opener = await chrome.tabs.get(tab.openerTabId).catch(() => null);
+    if (!opener || typeof opener.groupId !== "number" || opener.groupId === -1) {
+      return;
+    }
+    const owner = await this.store.findSessionByGroup(opener.groupId);
+    if (!owner || !owner.session.tabOrigins?.[String(opener.id)]) {
+      return;
+    }
+    owner.session.tabOrigins[String(tab.id)] ??= "agent";
+    await this.store.save();
   }
 
   ping() {
@@ -435,7 +460,9 @@ class BrowserBackend {
       throw new Error(`Chrome tab ${tabId} has no id`);
     }
     if (tab.url?.startsWith("chrome://")) {
-      throw new Error(`Chrome internal tab ${tabId} cannot be claimed`);
+      throw new Error(
+        `Tab ${tabId} shows ${tab.url}; Chrome does not let extensions control chrome:// pages. Open the page in a new tab with open-tab --url if it has a web equivalent.`
+      );
     }
     if (typeof tab.groupId === "number" && tab.groupId !== -1) {
       const owner = await this.store.findSessionByGroup(tab.groupId);
@@ -456,7 +483,9 @@ class BrowserBackend {
     if (!Array.isArray(params.keep)) {
       throw new Error("finalizeTabs requires keep array");
     }
-    const tabs = await this.getSessionTabs(session.sessionId);
+    // Include chrome:// tabs: an agent tab navigated to one is still the
+    // session's to close, and leaving it would strand it in the group.
+    const tabs = await this.getSessionTabs(session.sessionId, { includeInternal: true });
     const knownTabIds = new Set(tabs.filter(hasTabId).map((tab) => tab.id));
     const keep = new Map();
     for (const entry of params.keep) {
@@ -572,6 +601,9 @@ class BrowserBackend {
       }
     }
     this.attachedTabs.add(tabId);
+    // Page events are off until Page.enable; without them a JavaScript dialog
+    // is invisible and every later command just times out.
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
   }
 
   async detach(params) {
@@ -592,7 +624,13 @@ class BrowserBackend {
       typeof params.timeoutMs === "number" && params.timeoutMs > 0
         ? params.timeoutMs
         : DEFAULT_CDP_TIMEOUT_MS;
-    return await withTimeout(timeoutMs, async () => {
+    if (typeof tabId === "number" && params.method !== "Page.handleJavaScriptDialog") {
+      const dialog = this.dialogsByTabId.get(tabId);
+      if (dialog) {
+        throw new Error(dialogBlockedMessage(tabId, dialog));
+      }
+    }
+    const send = async () => {
       if (params.method === "Target.getTargets") {
         return { targetInfos: await chrome.debugger.getTargets() };
       }
@@ -613,7 +651,46 @@ class BrowserBackend {
         await this.ensureAttached(tabId);
         return await chrome.debugger.sendCommand(target, params.method, commandParams);
       }
-    });
+    };
+    try {
+      const result = await withTimeout(timeoutMs, () =>
+        params.method === "Page.captureScreenshot" && typeof tabId === "number"
+          ? this.withTabVisible(tabId, send)
+          : send()
+      );
+      if (params.method === "Page.handleJavaScriptDialog" && typeof tabId === "number") {
+        this.dialogsByTabId.delete(tabId);
+      }
+      return result;
+    } catch (error) {
+      // A command that opens a dialog (a click on a button that calls alert())
+      // never returns; say why instead of reporting a bare timeout.
+      const dialog = typeof tabId === "number" ? this.dialogsByTabId.get(tabId) : null;
+      if (dialog && params.method !== "Page.handleJavaScriptDialog") {
+        throw new Error(`${dialogBlockedMessage(tabId, dialog)} The ${params.method} command may already have run.`);
+      }
+      throw error;
+    }
+  }
+
+  // Chromium stops painting hidden tabs, so Page.captureScreenshot on a
+  // background tab hangs or returns a blank frame. Switch to the tab within its
+  // window for the capture and switch back; the window is not focused.
+  async withTabVisible(tabId, fn) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.active || typeof tab.windowId !== "number") {
+      return await fn();
+    }
+    const [previous] = await chrome.tabs.query({ active: true, windowId: tab.windowId }).catch(() => []);
+    await chrome.tabs.update(tabId, { active: true });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, TAB_PAINT_DELAY_MS));
+      return await fn();
+    } finally {
+      if (hasTabId(previous) && previous.id !== tabId) {
+        await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+      }
+    }
   }
 
   async webmcp_list_tools(params) {
@@ -978,7 +1055,21 @@ class BrowserBackend {
   }
 
   handleCdpEvent(source, method, params) {
-    if (method !== "Page.fileChooserOpened" || typeof source?.tabId !== "number") {
+    if (typeof source?.tabId !== "number") {
+      return;
+    }
+    if (method === "Page.javascriptDialogOpening" && !source.sessionId) {
+      this.dialogsByTabId.set(source.tabId, {
+        type: params?.type ?? "alert",
+        message: String(params?.message ?? "")
+      });
+      return;
+    }
+    if (method === "Page.javascriptDialogClosed" && !source.sessionId) {
+      this.dialogsByTabId.delete(source.tabId);
+      return;
+    }
+    if (method !== "Page.fileChooserOpened") {
       return;
     }
     const waiter = this.fileChooserWaitersByTabId.get(source.tabId);
@@ -1223,14 +1314,14 @@ class BrowserBackend {
     await this.publishCursorState(tabId);
   }
 
-  async getSessionTabs(sessionId) {
+  async getSessionTabs(sessionId, { includeInternal = false } = {}) {
     const session = await this.store.getSession(sessionId);
     if (typeof session.chromeGroupId !== "number") {
       return [];
     }
     try {
       return (await chrome.tabs.query({ groupId: session.chromeGroupId })).filter(
-        (tab) => hasTabId(tab) && !tab.url?.startsWith("chrome://")
+        (tab) => hasTabId(tab) && (includeInternal || !isInternalTab(tab))
       );
     } catch {
       await this.store.removeSession(sessionId);
@@ -1256,9 +1347,15 @@ class BrowserBackend {
   async requireSessionTab(params, command) {
     const session = await this.requireSession(params);
     const tabId = requireTabId(params, command);
-    const tabs = await this.getSessionTabs(session.sessionId);
-    if (!tabs.some((tab) => tab.id === tabId)) {
+    const tabs = await this.getSessionTabs(session.sessionId, { includeInternal: true });
+    const tab = tabs.find((candidate) => candidate.id === tabId);
+    if (!tab) {
       throw new Error(`Tab ${tabId} is not part of browser session ${session.sessionId}`);
+    }
+    if (isInternalTab(tab)) {
+      throw new Error(
+        `Tab ${tabId} shows ${tab.url}; Chrome does not let extensions control chrome:// pages. Use another tab, or open-tab --url with a web page; finalize-tabs still closes this one.`
+      );
     }
   }
 
@@ -1616,6 +1713,21 @@ function cursorArrivalKey(sessionId, turnId, moveSequence) {
 // attachment is gone before a command is sent.
 function isDebuggerNotAttachedError(error) {
   return /is not attached/i.test(String(error?.message ?? error));
+}
+
+const TAB_PAINT_DELAY_MS = 150;
+
+function isInternalTab(tab) {
+  return /^(chrome|chrome-untrusted|devtools):\/\//.test(tab?.url ?? tab?.pendingUrl ?? "");
+}
+
+function dialogBlockedMessage(tabId, dialog) {
+  const text = dialog.message.length > 200 ? `${dialog.message.slice(0, 200)}…` : dialog.message;
+  return (
+    `Tab ${tabId} is blocked by a JavaScript ${dialog.type} dialog: "${text}". ` +
+    `Close it with: obu cdp --tab-id ${tabId} --method Page.handleJavaScriptDialog --params '{"accept":true}' ` +
+    `(accept:false dismisses; add "promptText" for a prompt).`
+  );
 }
 
 async function withTimeout(timeoutMs, fn) {

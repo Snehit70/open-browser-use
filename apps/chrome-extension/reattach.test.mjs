@@ -135,7 +135,11 @@ async function run() {
     state.attached.delete(7); // Chrome-side detach; backend still thinks attached
     const result = await cdp(backend, 7, "Page.captureScreenshot");
     assert.deepEqual(result, { ok: "Page.captureScreenshot" });
-    assert.deepEqual(state.sent.slice(-2), ["Page.captureScreenshot", "Page.captureScreenshot"]);
+    // Re-attaching also re-enables Page events (for dialog detection).
+    assert.deepEqual(
+      state.sent.filter((method) => method !== "Page.enable").slice(-2),
+      ["Page.captureScreenshot", "Page.captureScreenshot"]
+    );
     console.log("test 2 ok: re-attaches and retries once after Chrome detached");
   }
 
