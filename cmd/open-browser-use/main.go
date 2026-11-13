@@ -96,6 +96,7 @@ func newRootCommand() *cobra.Command {
 		newNavigateCommand(),
 		newWaitLoadCommand(),
 		newPageInfoCommand(),
+		newFramesCommand(),
 		newSimpleRPCCommand("ping", "ping", "Ping the browser backend"),
 		newSimpleRPCCommand("info", "getInfo", "Print browser backend info"),
 		newSimpleRPCCommand("tabs", "getTabs", "List session tabs"),
@@ -1346,6 +1347,7 @@ func newNameSessionCommand() *cobra.Command {
 func newCdpCommand() *cobra.Command {
 	var options socketOptions
 	var tabID int
+	var frame string
 	var method string
 	var commandParamsJSON string
 	cmd := &cobra.Command{
@@ -1365,8 +1367,11 @@ func newCdpCommand() *cobra.Command {
 				return fmt.Errorf("cdp --params must be a JSON object: %w", err)
 			}
 			target := map[string]any{}
+			if frame != "" && tabID <= 0 {
+				return errors.New("cdp --frame requires --tab-id")
+			}
 			if tabID > 0 {
-				target["tabId"] = tabID
+				target = tabTarget(tabID, frame)
 				if err := attachTab(options, tabID); err != nil {
 					return err
 				}
@@ -1401,6 +1406,7 @@ func newCdpCommand() *cobra.Command {
 	}
 	addSocketFlags(cmd, &options)
 	cmd.Flags().IntVar(&tabID, "tab-id", 0, "optional tab id target")
+	cmd.Flags().StringVar(&frame, "frame", "", "run inside a cross-origin iframe: URL substring or session id from `frames`")
 	cmd.Flags().StringVar(&method, "method", "", "Chrome DevTools Protocol method")
 	cmd.Flags().StringVar(&commandParamsJSON, "params", "{}", "Chrome DevTools Protocol command params: inline JSON, @file.json, or - for stdin")
 	return cmd
@@ -1602,7 +1608,22 @@ func newWaitLoadCommand() *cobra.Command {
 }
 
 func newPageInfoCommand() *cobra.Command {
-	return newRunnerTabCommand("page-info", "Print a session tab's title, URL, ready state, and visible text", (*actionRunner).runPageInfoAction, nil)
+	return newRunnerTabCommand("page-info", "Print a session tab's title, URL, ready state, and visible text", (*actionRunner).runPageInfoAction, frameFlag)
+}
+
+func newFramesCommand() *cobra.Command {
+	return newRunnerTabCommand("frames", "List a session tab's cross-origin iframes for cdp/page-info --frame", (*actionRunner).runFramesAction, nil)
+}
+
+func frameFlag(cmd *cobra.Command) func() []string {
+	var frame string
+	cmd.Flags().StringVar(&frame, "frame", "", "read a cross-origin iframe: URL substring or session id from `frames`")
+	return func() []string {
+		if frame == "" {
+			return nil
+		}
+		return []string{"--frame", frame}
+	}
 }
 
 func newVersionCommand() *cobra.Command {
@@ -1991,6 +2012,8 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 		return runner.runWaitLoadAction(args)
 	case "page-info":
 		return runner.runPageInfoAction(args)
+	case "frames":
+		return runner.runFramesAction(args)
 	case "cdp":
 		return runner.runCDPAction(args)
 	case "history":
@@ -2117,6 +2140,25 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 	}
 }
 
+func (runner *actionRunner) runFramesAction(args []string) (map[string]any, int, error) {
+	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
+	if err != nil {
+		return nil, 0, err
+	}
+	response, _, err := runner.invoke("listFrames", map[string]any{"tabId": tabID})
+	return response, tabID, err
+}
+
+// tabTarget builds an executeCdp target; frame selects a cross-origin iframe
+// (URL substring or child session id) that the extension resolves.
+func tabTarget(tabID int, frame string) map[string]any {
+	target := map[string]any{"tabId": tabID}
+	if frame != "" {
+		target["frame"] = frame
+	}
+	return target
+}
+
 func (runner *actionRunner) runPageInfoAction(args []string) (map[string]any, int, error) {
 	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
 	if err != nil {
@@ -2126,7 +2168,7 @@ func (runner *actionRunner) runPageInfoAction(args []string) (map[string]any, in
 		return nil, 0, err
 	}
 	response, _, err := runner.invoke("executeCdp", map[string]any{
-		"target": map[string]any{"tabId": tabID},
+		"target": tabTarget(tabID, stringFlag(args, "--frame")),
 		"method": "Runtime.evaluate",
 		"commandParams": map[string]any{
 			"expression":    `({ title: document.title ?? "", url: location.href, readyState: document.readyState, text: document.body?.innerText ?? "" })`,
@@ -2162,7 +2204,7 @@ func (runner *actionRunner) runCDPAction(args []string) (map[string]any, int, er
 	}
 	execute := func() (map[string]any, int, error) {
 		return runner.invoke("executeCdp", map[string]any{
-			"target":        map[string]any{"tabId": tabID},
+			"target":        tabTarget(tabID, stringFlag(args, "--frame")),
 			"method":        method,
 			"commandParams": commandParams,
 			"timeoutMs":     cdpTimeoutMs(runner.options.timeout),

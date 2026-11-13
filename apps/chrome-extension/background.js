@@ -314,11 +314,15 @@ class BrowserBackend {
     this.fileChoosersById = new Map();
     this.fileChooserWaitersByTabId = new Map();
     this.dialogsByTabId = new Map();
+    // tabId -> Map(sessionId -> child target) for out-of-process iframes,
+    // which Runtime.evaluate on the tab cannot see.
+    this.framesByTabId = new Map();
     this.nextCursorMoveSequence = 1;
     chrome.debugger.onDetach.addListener((source) => {
       if (typeof source.tabId === "number") {
         this.attachedTabs.delete(source.tabId);
         this.dialogsByTabId.delete(source.tabId);
+        this.framesByTabId.delete(source.tabId);
       }
     });
     // Links with target=_blank and window.open() in a session tab land in the
@@ -604,6 +608,87 @@ class BrowserBackend {
     // Page events are off until Page.enable; without them a JavaScript dialog
     // is invisible and every later command just times out.
     await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+    await this.enableFrameAttach({ tabId });
+  }
+
+  // Cross-site iframes run in their own renderer. Auto-attach (flatten) gives
+  // each one a child session that commands can target with {tabId, sessionId}.
+  async enableFrameAttach(target) {
+    await chrome.debugger
+      .sendCommand(target, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true
+      })
+      .catch(() => {});
+  }
+
+  frameList(tabId) {
+    return [...(this.framesByTabId.get(tabId)?.values() ?? [])].filter((frame) => frame.type === "iframe");
+  }
+
+  async listFrames(params) {
+    await this.requireSessionTab(params, "listFrames");
+    const tabId = requireTabId(params, "listFrames");
+    await this.ensureAttached(tabId);
+    if (this.frameList(tabId).length === 0) {
+      await this.resyncFrames(tabId);
+    }
+    const tab = await chrome.tabs.get(tabId);
+    return {
+      frames: [
+        { sessionId: null, type: "page", url: tab.url ?? "", title: tab.title ?? "" },
+        ...this.frameList(tabId).map(({ sessionId, url, title, parentSessionId }) => ({
+          sessionId,
+          type: "iframe",
+          url,
+          title,
+          ...(parentSessionId ? { parentSessionId } : {})
+        }))
+      ]
+    };
+  }
+
+  // A service worker restart forgets child sessions while Chrome keeps them;
+  // toggling auto-attach makes Chrome announce them again.
+  async resyncFrames(tabId) {
+    await chrome.debugger
+      .sendCommand({ tabId }, "Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true })
+      .catch(() => {});
+    await this.enableFrameAttach({ tabId });
+    await new Promise((resolve) => setTimeout(resolve, FRAME_ATTACH_SETTLE_MS));
+  }
+
+  // Resolve --frame: an exact child sessionId or targetId, else the first
+  // iframe whose URL contains the text. Waits briefly for iframes that are
+  // still loading or re-attaching.
+  async resolveFrame(tabId, match) {
+    const find = () =>
+      this.frameList(tabId).find((frame) => frame.sessionId === match || frame.targetId === match) ??
+      this.frameList(tabId).find((frame) => frame.url.includes(match));
+    const deadline = Date.now() + FRAME_RESOLVE_WAIT_MS;
+    let resynced = false;
+    while (true) {
+      const frame = find();
+      if (frame) {
+        return frame;
+      }
+      if (!resynced && this.frameList(tabId).length === 0) {
+        resynced = true;
+        await this.resyncFrames(tabId);
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        const known = this.frameList(tabId).map((frame) => frame.url);
+        throw new Error(
+          `No cross-origin iframe in tab ${tabId} matches "${match}". ` +
+            (known.length > 0
+              ? `Iframes: ${known.join(", ")}.`
+              : "The tab has none; same-origin iframes are reachable from the page through iframe.contentDocument.")
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   async detach(params) {
@@ -614,8 +699,8 @@ class BrowserBackend {
 
   async executeCdp(params) {
     await this.requireSession(params);
-    const target = params.target && typeof params.target === "object" ? params.target : {};
-    const tabId = target.tabId;
+    const rawTarget = params.target && typeof params.target === "object" ? params.target : {};
+    const tabId = rawTarget.tabId;
     if (typeof tabId === "number") {
       await this.requireSessionTab({ ...params, tabId }, "executeCdp");
       await this.ensureAttached(tabId);
@@ -628,6 +713,22 @@ class BrowserBackend {
       const dialog = this.dialogsByTabId.get(tabId);
       if (dialog) {
         throw new Error(dialogBlockedMessage(tabId, dialog));
+      }
+    }
+    let target = { ...rawTarget };
+    delete target.frame;
+    const frameMatch = typeof rawTarget.frame === "string" && rawTarget.frame !== "" ? rawTarget.frame : null;
+    const resolveTarget = async () => {
+      if (frameMatch && typeof tabId === "number") {
+        target = { tabId, sessionId: (await this.resolveFrame(tabId, frameMatch)).sessionId };
+      }
+    };
+    await resolveTarget();
+    // A dialog opened by an iframe must be answered in that iframe's session.
+    if (params.method === "Page.handleJavaScriptDialog" && typeof tabId === "number" && !target.sessionId) {
+      const dialogSession = this.dialogsByTabId.get(tabId)?.sessionId;
+      if (dialogSession) {
+        target = { tabId, sessionId: dialogSession };
       }
     }
     const send = async () => {
@@ -648,7 +749,9 @@ class BrowserBackend {
           throw error;
         }
         this.attachedTabs.delete(tabId);
+        this.framesByTabId.delete(tabId);
         await this.ensureAttached(tabId);
+        await resolveTarget();
         return await chrome.debugger.sendCommand(target, params.method, commandParams);
       }
     };
@@ -1058,15 +1161,52 @@ class BrowserBackend {
     if (typeof source?.tabId !== "number") {
       return;
     }
-    if (method === "Page.javascriptDialogOpening" && !source.sessionId) {
+    if (method === "Page.javascriptDialogOpening") {
       this.dialogsByTabId.set(source.tabId, {
         type: params?.type ?? "alert",
-        message: String(params?.message ?? "")
+        message: String(params?.message ?? ""),
+        ...(source.sessionId ? { sessionId: source.sessionId } : {})
       });
       return;
     }
-    if (method === "Page.javascriptDialogClosed" && !source.sessionId) {
+    if (method === "Page.javascriptDialogClosed") {
       this.dialogsByTabId.delete(source.tabId);
+      return;
+    }
+    if (method === "Target.attachedToTarget" && params?.sessionId) {
+      const info = params.targetInfo ?? {};
+      let frames = this.framesByTabId.get(source.tabId);
+      if (!frames) {
+        frames = new Map();
+        this.framesByTabId.set(source.tabId, frames);
+      }
+      frames.set(params.sessionId, {
+        sessionId: params.sessionId,
+        targetId: info.targetId,
+        type: info.type,
+        url: info.url ?? "",
+        title: info.title ?? "",
+        ...(source.sessionId ? { parentSessionId: source.sessionId } : {})
+      });
+      if (info.type === "iframe") {
+        // Dialog events and nested cross-site iframes need the same setup.
+        const child = { tabId: source.tabId, sessionId: params.sessionId };
+        chrome.debugger.sendCommand(child, "Page.enable", {}).catch(() => {});
+        this.enableFrameAttach(child);
+      }
+      return;
+    }
+    if (method === "Target.detachedFromTarget" && params?.sessionId) {
+      this.framesByTabId.get(source.tabId)?.delete(params.sessionId);
+      return;
+    }
+    if (method === "Target.targetInfoChanged" && params?.targetInfo) {
+      for (const frame of this.framesByTabId.get(source.tabId)?.values() ?? []) {
+        if (frame.targetId === params.targetInfo.targetId) {
+          frame.url = params.targetInfo.url ?? frame.url;
+          frame.title = params.targetInfo.title ?? frame.title;
+        }
+      }
       return;
     }
     if (method !== "Page.fileChooserOpened") {
@@ -1460,6 +1600,7 @@ class BrowserBackend {
       await chrome.debugger.detach({ tabId });
     } finally {
       this.attachedTabs.delete(tabId);
+      this.framesByTabId.delete(tabId);
       for (const [fileChooserId, chooser] of this.fileChoosersById) {
         if (chooser.tabId === tabId) {
           this.fileChoosersById.delete(fileChooserId);
@@ -1716,6 +1857,8 @@ function isDebuggerNotAttachedError(error) {
 }
 
 const TAB_PAINT_DELAY_MS = 150;
+const FRAME_ATTACH_SETTLE_MS = 300;
+const FRAME_RESOLVE_WAIT_MS = 2_000;
 
 function isInternalTab(tab) {
   return /^(chrome|chrome-untrusted|devtools):\/\//.test(tab?.url ?? tab?.pendingUrl ?? "");

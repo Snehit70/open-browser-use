@@ -31,6 +31,7 @@ function createChromeFake() {
     removed: [],
     activations: [],
     sent: [],
+    targets: [],
     // Called for each sendCommand; return a promise to control timing.
     onSend: null,
     onCreated: null
@@ -92,8 +93,10 @@ function createChromeFake() {
     debugger: {
       async attach() {},
       async detach() {},
-      async sendCommand({ tabId }, method) {
+      async sendCommand(target, method) {
+        const { tabId } = target;
         state.sent.push(method);
+        state.targets.push({ ...target, method });
         if (state.onSend) return await state.onSend(tabId, method);
         return { ok: method, active: state.tabs.get(tabId)?.active };
       },
@@ -186,6 +189,57 @@ async function run() {
     await cdp(backend, 1, "Page.captureScreenshot");
     assert.deepEqual(state.activations, [], "an active tab is captured in place");
     console.log("test 5 ok: background tab screenshots switch to the tab and back");
+  }
+  {
+    const { backend, state } = await loadBackend();
+    await cdp(backend, 1, "Runtime.evaluate");
+    assert.ok(
+      state.targets.some((t) => t.method === "Target.setAutoAttach" && !t.sessionId),
+      "attach turns on iframe auto-attach"
+    );
+    const frameInfo = { type: "iframe", targetId: "T1", url: "https://ads.example/frame", title: "" };
+    backend.handleCdpEvent({ tabId: 1 }, "Target.attachedToTarget", { sessionId: "S1", targetInfo: frameInfo });
+    backend.handleCdpEvent({ tabId: 1, sessionId: "S1" }, "Target.attachedToTarget", {
+      sessionId: "S2",
+      targetInfo: { type: "iframe", targetId: "T2", url: "https://pay.example/inner", title: "" }
+    });
+    backend.handleCdpEvent({ tabId: 1 }, "Target.attachedToTarget", {
+      sessionId: "W1",
+      targetInfo: { type: "worker", targetId: "TW", url: "https://a.test/w.js" }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(
+      state.targets.some((t) => t.sessionId === "S1" && t.method === "Target.setAutoAttach"),
+      "nested iframes are auto-attached too"
+    );
+    const { frames } = JSON.parse(JSON.stringify(await backend.listFrames({ session_id: "s1", turn_id: "t", tabId: 1 })));
+    assert.deepEqual(
+      frames.map((f) => [f.type, f.sessionId, f.url]),
+      [["page", null, "https://a.test/"], ["iframe", "S1", "https://ads.example/frame"], ["iframe", "S2", "https://pay.example/inner"]]
+    );
+    assert.equal(frames[2].parentSessionId, "S1");
+
+    await cdp(backend, 1, "Runtime.evaluate", { target: { tabId: 1, frame: "pay.example" } });
+    assert.deepEqual(state.targets.at(-1), { tabId: 1, sessionId: "S2", method: "Runtime.evaluate" });
+    await cdp(backend, 1, "Runtime.evaluate", { target: { tabId: 1, frame: "S1" } });
+    assert.equal(state.targets.at(-1).sessionId, "S1", "exact session id selects the frame");
+
+    backend.handleCdpEvent({ tabId: 1 }, "Target.targetInfoChanged", { targetInfo: { targetId: "T1", url: "https://ads.example/next" } });
+    await cdp(backend, 1, "Runtime.evaluate", { target: { tabId: 1, frame: "ads.example/next" } });
+    assert.equal(state.targets.at(-1).sessionId, "S1", "frame URL follows navigation");
+
+    backend.handleCdpEvent({ tabId: 1, sessionId: "S2" }, "Page.javascriptDialogOpening", { type: "alert", message: "from iframe" });
+    await assert.rejects(cdp(backend, 1, "Runtime.evaluate"), /from iframe/);
+    await cdp(backend, 1, "Page.handleJavaScriptDialog");
+    assert.deepEqual(state.targets.at(-1), { tabId: 1, sessionId: "S2", method: "Page.handleJavaScriptDialog" },
+      "an iframe's dialog is answered in its own session");
+
+    backend.handleCdpEvent({ tabId: 1, sessionId: "S1" }, "Target.detachedFromTarget", { sessionId: "S2" });
+    await assert.rejects(
+      cdp(backend, 1, "Runtime.evaluate", { target: { tabId: 1, frame: "pay.example" } }),
+      /No cross-origin iframe in tab 1 matches "pay.example". Iframes: https:\/\/ads.example\/next/
+    );
+    console.log("test 6 ok: cross-origin iframes are listed and targetable with --frame");
   }
   console.log("\nAll page access tests passed.");
 }
