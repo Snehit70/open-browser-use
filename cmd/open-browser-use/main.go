@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -2415,30 +2416,62 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 
 const clickSettleDelay = 1200 * time.Millisecond
 
-// scrollStateScript reports the scroll position, visibility, and (with a
-// selector) how many matching items the page has rendered so far.
-// Many apps scroll an inner element rather than the page, so measure the
-// nearest scrollable ancestor of whatever sits at the viewport center.
+// scrollStateScript snapshots every scrollable element that a wheel at the
+// viewport center could move (the ancestors of the element there, plus body
+// and the page), so the CLI can tell whether a wheel step moved anything.
+// Element ids live in a page-side WeakMap so they stay stable across calls.
 const scrollStateScript = `((selector) => {
+  const reg = (window.__obuScroll ??= { ids: new WeakMap(), next: 0 });
   const page = document.scrollingElement || document.documentElement;
-  const scrolls = (e) => e.scrollHeight > e.clientHeight + 1 && /(auto|scroll|overlay)/.test(getComputedStyle(e).overflowY);
-  let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
-  while (el && el !== page && el !== document.body && !scrolls(el)) el = el.parentElement;
-  const scroller = el && el !== document.body && scrolls(el) ? el : page;
+  const chain = new Set([page, document.body]);
+  for (let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2); el; el = el.parentElement) chain.add(el);
+  const positions = {}, labels = {};
+  let height = 0;
+  for (const el of chain) {
+    if (!el || el.scrollHeight <= el.clientHeight + 1) continue;
+    let id = reg.ids.get(el);
+    if (id === undefined) { id = ++reg.next; reg.ids.set(el, id); }
+    positions[id] = Math.round(el.scrollTop);
+    labels[id] = el === page ? "page" : el === document.body ? "body" : el.tagName.toLowerCase() + (el.id ? "#" + el.id : "");
+    height += el.scrollHeight;
+  }
   return {
-    scrollY: Math.round(scroller.scrollTop),
-    atBottom: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2,
-    atTop: scroller.scrollTop <= 0,
-    scroller: scroller === page ? "page" : scroller.tagName.toLowerCase() + (scroller.id ? "#" + scroller.id : ""),
-    visibilityState: document.visibilityState,
+    positions, labels, height, visibilityState: document.visibilityState,
     viewport: [innerWidth, innerHeight],
     ...(selector ? { count: document.querySelectorAll(selector).length } : {})
   };
 })`
 
+// scrollNudgeScript scrolls the largest scrollable element (among the page,
+// body, and the ancestors of the element at the viewport center) that still
+// has room in the given direction. It is the fallback when a wheel at the
+// center lands on a nested box that has reached its end and swallows the
+// event. Returns whether it found something to scroll.
+const scrollNudgeScript = `((dy) => {
+  const page = document.scrollingElement || document.documentElement;
+  const chain = new Set([page, document.body]);
+  for (let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2); el; el = el.parentElement) chain.add(el);
+  let best = null;
+  for (const el of chain) {
+    if (!el) continue;
+    const overflow = getComputedStyle(el).overflowY;
+    if (overflow === "hidden" || overflow === "clip") continue;
+    if (el !== page && !/^(auto|scroll|overlay)$/.test(overflow)) continue;
+    const room = dy > 0 ? el.scrollHeight - el.clientHeight - el.scrollTop : el.scrollTop;
+    if (room >= 1 && (!best || el.scrollHeight > best.scrollHeight)) best = el;
+  }
+  if (!best) return false;
+  best.scrollBy(0, dy);
+  return true;
+})`
+
 // runScrollAction scrolls with real mouse-wheel input so infinite feeds and
 // lazy loaders fire. It turns on focus emulation first: without it a
-// background tab reports itself hidden and many pages never load more.
+// background tab reports itself hidden and many pages never load more. It
+// stops when a step neither moves any scrollable element nor grows the page
+// (rechecked after another 2x --wait-ms), or once --until-count items exist. If a
+// wheel moves nothing but some page scroller still has room, it switches to
+// element.scrollBy for the remaining steps (reported as input "scrollBy").
 func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int, error) {
 	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
 	if err != nil {
@@ -2491,6 +2524,11 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 	if _, err := cdp("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}); err != nil {
 		return nil, 0, err
 	}
+	// A tab claimed from the user goes back to its real focus state afterwards;
+	// the extension keeps emulation on only for tabs the agent opened.
+	if runner.tabOrigin(tabID) == "user" {
+		defer cdp("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false})
+	}
 	before, err := state()
 	if err != nil {
 		return nil, 0, err
@@ -2504,17 +2542,64 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 			y = h / 2
 		}
 	}
-	after := before
-	steps := 0
-	for steps < times {
-		if until > 0 {
-			if count, ok := numberAsInt(after["count"]); ok && count >= until {
-				break
+	countReached := func(s map[string]any) bool {
+		count, ok := numberAsInt(s["count"])
+		return until > 0 && ok && count >= until
+	}
+	moved := map[string]float64{}
+	labels := map[string]string{}
+	track := func(from, to map[string]any) bool {
+		fromPos, _ := from["positions"].(map[string]any)
+		toPos, _ := to["positions"].(map[string]any)
+		toLabels, _ := to["labels"].(map[string]any)
+		any := false
+		for id, raw := range toPos {
+			now, _ := raw.(float64)
+			if was, ok := fromPos[id].(float64); ok && was != now {
+				moved[id] += math.Abs(now - was)
+				if label, ok := toLabels[id].(string); ok {
+					labels[id] = label
+				}
+				any = true
 			}
 		}
-		if _, err := cdp("Input.dispatchMouseEvent", map[string]any{
-			"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": pixels,
-		}); err != nil {
+		return any
+	}
+	grew := func(from, to map[string]any) bool {
+		fromHeight, _ := from["height"].(float64)
+		toHeight, _ := to["height"].(float64)
+		fromCount, _ := numberAsInt(from["count"])
+		toCount, _ := numberAsInt(to["count"])
+		return toHeight > fromHeight || toCount > fromCount
+	}
+	nudge := func(dy int) (bool, error) {
+		response, err := cdp("Runtime.evaluate", map[string]any{
+			"expression": scrollNudgeScript + "(" + strconv.Itoa(dy) + ")", "returnByValue": true,
+		})
+		if err != nil {
+			return false, err
+		}
+		result, _ := response["result"].(map[string]any)
+		inner, _ := result["result"].(map[string]any)
+		nudged, _ := inner["value"].(bool)
+		return nudged, nil
+	}
+	input := "wheel"
+	stopped := "times"
+	previous, after := before, before
+	steps := 0
+	for steps < times {
+		if countReached(after) {
+			stopped = "count"
+			break
+		}
+		if input == "wheel" {
+			if _, err := cdp("Input.dispatchMouseEvent", map[string]any{
+				"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": pixels,
+			}); err != nil {
+				return nil, 0, err
+			}
+		} else if _, err := nudge(pixels); err != nil {
 			return nil, 0, err
 		}
 		steps++
@@ -2522,24 +2607,96 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		if after, err = state(); err != nil {
 			return nil, 0, err
 		}
-		edge := "atBottom"
-		if pixels < 0 {
-			edge = "atTop"
+		progressed := track(previous, after) || grew(previous, after)
+		if !progressed {
+			// Background tabs render slowly; give the wheel and any lazy
+			// loader a longer second beat before deciding nothing happened.
+			time.Sleep(2 * time.Duration(waitMs) * time.Millisecond)
+			if after, err = state(); err != nil {
+				return nil, 0, err
+			}
+			progressed = track(previous, after) || grew(previous, after)
 		}
-		if after[edge] == true && steps < times {
-			// At the end: give a lazy loader one more beat, stop if nothing grew.
-			time.Sleep(time.Duration(waitMs) * time.Millisecond)
-			if again, err := state(); err == nil {
-				after = again
-				if again[edge] == true {
-					break
+		if !progressed && input == "wheel" && pixels != 0 {
+			// The wheel went nowhere, typically into a nested box at its end.
+			nudged, err := nudge(pixels)
+			if err != nil {
+				return nil, 0, err
+			}
+			if nudged {
+				input = "scrollBy"
+				time.Sleep(time.Duration(waitMs) * time.Millisecond)
+				if after, err = state(); err != nil {
+					return nil, 0, err
 				}
+				progressed = track(previous, after) || grew(previous, after)
+			}
+		}
+		if !progressed && input == "scrollBy" {
+			// An instant jump can land on the new bottom without the page ever
+			// rendering the loader sentinel out of view, so an
+			// IntersectionObserver feed sees no change. Step back and return.
+			if _, err := nudge(-pixels); err != nil {
+				return nil, 0, err
+			}
+			time.Sleep(time.Duration(waitMs) * time.Millisecond)
+			if _, err := nudge(pixels); err != nil {
+				return nil, 0, err
+			}
+			time.Sleep(2 * time.Duration(waitMs) * time.Millisecond)
+			if after, err = state(); err != nil {
+				return nil, 0, err
+			}
+			progressed = grew(previous, after)
+			track(previous, after)
+		}
+		if !progressed {
+			stopped = "end"
+			previous = after
+			break
+		}
+		previous = after
+	}
+	if countReached(after) {
+		stopped = "count"
+	}
+	scroller, scrolled := "", 0.0
+	for id, distance := range moved {
+		if distance > scrolled {
+			scroller, scrolled = labels[id], distance
+		}
+	}
+	summary := func(s map[string]any) map[string]any {
+		out := map[string]any{"visibilityState": s["visibilityState"], "height": s["height"]}
+		if count, ok := s["count"]; ok {
+			out["count"] = count
+		}
+		return out
+	}
+	result := map[string]any{"steps": steps, "stopped": stopped, "input": input, "before": summary(before), "after": summary(after)}
+	if scroller != "" {
+		result["scroller"] = scroller
+		result["scrolledPx"] = int(scrolled)
+	}
+	return map[string]any{"result": result}, tabID, nil
+}
+
+// tabOrigin returns "agent", "user", or "" (unknown, e.g. an older extension).
+func (runner *actionRunner) tabOrigin(tabID int) string {
+	response, _, err := runner.invoke("getTabs", map[string]any{})
+	if err != nil {
+		return ""
+	}
+	tabs, _ := response["result"].([]any)
+	for _, raw := range tabs {
+		if tab, ok := raw.(map[string]any); ok {
+			if id, ok := numberAsInt(tab["id"]); ok && id == tabID {
+				origin, _ := tab["origin"].(string)
+				return origin
 			}
 		}
 	}
-	delete(before, "viewport")
-	delete(after, "viewport")
-	return map[string]any{"result": map[string]any{"steps": steps, "before": before, "after": after}}, tabID, nil
+	return ""
 }
 
 func (runner *actionRunner) sessionTabIDs() []int {

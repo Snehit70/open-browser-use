@@ -49,6 +49,7 @@ function createChromeFake() {
     },
     tabs: {
       async get(id) {
+        if (state.slowGet?.[id]) await new Promise((resolve) => setTimeout(resolve, state.slowGet[id]));
         if (!state.tabs.has(id)) throw new Error("No tab");
         return { ...state.tabs.get(id) };
       },
@@ -149,6 +150,19 @@ async function run() {
     await cdp(backend, 1, "Page.handleJavaScriptDialog");
     assert.deepEqual(await cdp(backend, 1, "Runtime.evaluate"), { ok: "Runtime.evaluate", active: false });
     console.log("test 1 ok: open dialog fails fast with a fix, and handling it clears the block");
+  }
+  {
+    const { backend, state } = await loadBackend();
+    state.tabs.set(6, { id: 6, groupId: 9, windowId: 1, openerTabId: 1, url: "https://spawned.test/" });
+    state.slowGet = { 1: 30 }; // the opener lookup in recordSpawnedTab is slow
+    state.onCreated(state.tabs.get(6));
+    // No await between the tab appearing and the first command: the spawn
+    // record must land before attach decides on focus emulation.
+    await cdp(backend, 6, "Runtime.evaluate");
+    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "a link-spawned tab gets focus emulation");
+    const tabs = await backend.getTabs({ session_id: "s1", turn_id: "t" });
+    assert.equal(tabs.find((tab) => tab.id === 6)?.origin, "agent", "getTabs reports tab origin");
+    console.log("test 1b ok: spawned tabs are known as agent tabs before first attach; getTabs reports origin");
   }
   {
     const { backend, state } = await loadBackend();

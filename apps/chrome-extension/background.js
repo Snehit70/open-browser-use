@@ -317,6 +317,7 @@ class BrowserBackend {
     // tabId -> Map(sessionId -> child target) for out-of-process iframes,
     // which Runtime.evaluate on the tab cannot see.
     this.framesByTabId = new Map();
+    this.pendingSpawns = new Map();
     this.nextCursorMoveSequence = 1;
     chrome.debugger.onDetach.addListener((source) => {
       if (typeof source.tabId === "number") {
@@ -329,7 +330,13 @@ class BrowserBackend {
     // session group with no recorded origin, so finalize would only ungroup
     // them and leave them open. Record them as agent tabs.
     chrome.tabs?.onCreated?.addListener((tab) => {
-      this.recordSpawnedTab(tab).catch(() => {});
+      const pending = this.recordSpawnedTab(tab).catch(() => {});
+      if (hasTabId(tab)) {
+        // ensureAttached waits on this so a spawned tab is known to be an
+        // agent tab before deciding on focus emulation.
+        this.pendingSpawns.set(tab.id, pending);
+        pending.finally(() => this.pendingSpawns.delete(tab.id));
+      }
     });
   }
 
@@ -387,7 +394,11 @@ class BrowserBackend {
   async getTabs(params) {
     const session = await this.requireSession(params);
     const tabs = await this.getSessionTabs(session.sessionId);
-    return await this.withLogicalActive(session.sessionId, tabs.map(toBrowserTab));
+    const origins = (await this.store.getSession(session.sessionId)).tabOrigins ?? {};
+    return await this.withLogicalActive(
+      session.sessionId,
+      tabs.map((tab) => ({ ...toBrowserTab(tab), origin: origins[String(tab.id)] ?? null }))
+    );
   }
 
   async getUserTabs(params) {
@@ -605,6 +616,7 @@ class BrowserBackend {
       }
     }
     this.attachedTabs.add(tabId);
+    await this.pendingSpawns?.get(tabId);
     // Page events are off until Page.enable; without them a JavaScript dialog
     // is invisible and every later command just times out.
     await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
