@@ -184,7 +184,7 @@ func newSetupCommand() *cobra.Command {
 	cmd.Flags().StringVar(&binaryPath, "path", "", "native host binary target for the stable host link")
 	cmd.Flags().StringVar(&externalExtensionOutput, "external-extension-output", "", "Chrome external extension JSON output path")
 	cmd.Flags().StringVar(&zipPath, "zip", "", "existing extension ZIP path; use it instead of the Chrome Web Store")
-	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, bitbrowser, or BitBrowser instance id)")
+	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, helium, bitbrowser, or BitBrowser instance id)")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "register Chrome integration without opening Chrome or the file manager")
 	cmd.AddCommand(newSetupBetaCommand())
 	return cmd
@@ -215,7 +215,7 @@ func newSetupBetaCommand() *cobra.Command {
 	cmd.Flags().StringVar(&extensionID, "extension-id", defaultChromeExtensionID, "Chrome extension id for allowed_origins")
 	cmd.Flags().StringVar(&binaryPath, "path", "", "native host binary target for the stable host link")
 	cmd.Flags().StringVar(&zipPath, "zip", "", "existing extension zip path; defaults to the latest GitHub Release zip")
-	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, bitbrowser, or BitBrowser instance id)")
+	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, helium, bitbrowser, or BitBrowser instance id)")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "download and unpack the extension without opening Chrome")
 	return cmd
 }
@@ -336,7 +336,7 @@ func newInstallManifestCommand() *cobra.Command {
 	cmd.Flags().StringVar(&extensionID, "extension-id", defaultChromeExtensionID, "Chrome extension id for allowed_origins")
 	cmd.Flags().StringVar(&binaryPath, "path", "", "native host binary target for the stable host link")
 	cmd.Flags().StringVar(&outputPath, "output", "", "native host manifest output path")
-	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, bitbrowser, or BitBrowser instance id)")
+	cmd.Flags().StringVar(&browser, "browser", "", "browser to register (chrome, chrome-beta, helium, bitbrowser, or BitBrowser instance id)")
 	return cmd
 }
 
@@ -1161,7 +1161,7 @@ func addSocketFlags(cmd *cobra.Command, options *socketOptions) {
 	cmd.Flags().StringVar(&options.socketDir, "socket-dir", host.DefaultSocketDir, "directory containing active socket registry")
 	cmd.Flags().DurationVar(&options.timeout, "timeout", 10*time.Second, "request timeout")
 	cmd.Flags().StringVar(&options.sessionID, "session-id", options.sessionID, "browser session id used for tab grouping and cleanup")
-	cmd.Flags().StringVar(&options.browser, "browser", "", "browser selector (chrome, chrome-beta, bitbrowser, or display name)")
+	cmd.Flags().StringVar(&options.browser, "browser", "", "browser selector (chrome, chrome-beta, helium, bitbrowser, or display name)")
 	cmd.Flags().StringVar(&options.profile, "profile", "", "Chrome profile selector (directory name like \"Default\" / \"Profile 1\" or display name like \"Eva\")")
 }
 
@@ -1750,11 +1750,18 @@ func supportedBrowserProfileRoots() ([]browserProfileRoot, error) {
 		roots = append(roots, bitBrowserRoots...)
 		return roots, nil
 	case "linux":
-		return []browserProfileRoot{{
-			BrowserID:   "chrome",
-			BrowserName: "Google Chrome",
-			Root:        filepath.Join(home, ".config/google-chrome"),
-		}}, nil
+		return dedupeAliasedRoots([]browserProfileRoot{
+			{
+				BrowserID:   "helium",
+				BrowserName: "Helium",
+				Root:        filepath.Join(home, ".config/net.imput.helium"),
+			},
+			{
+				BrowserID:   "chrome",
+				BrowserName: "Google Chrome",
+				Root:        filepath.Join(home, ".config/google-chrome"),
+			},
+		}), nil
 	case "windows":
 		localAppData := os.Getenv("LOCALAPPDATA")
 		if strings.TrimSpace(localAppData) == "" {
@@ -1775,6 +1782,63 @@ func supportedBrowserProfileRoots() ([]browserProfileRoot, error) {
 	default:
 		return nil, fmt.Errorf("browser profile detection is not implemented for %s", runtime.GOOS)
 	}
+}
+
+// dedupeAliasedRoots drops a root that is a symlink to another root's
+// directory. Some setups link ~/.config/google-chrome to another Chromium
+// browser's directory so Chrome-only native hosts work there; those profiles
+// belong to the real browser, not to Chrome.
+func dedupeAliasedRoots(roots []browserProfileRoot) []browserProfileRoot {
+	seen := map[string]bool{}
+	var out []browserProfileRoot
+	for _, root := range roots {
+		if info, err := os.Lstat(root.Root); err == nil && info.Mode()&os.ModeSymlink == 0 {
+			if resolved, err := filepath.EvalSymlinks(root.Root); err == nil {
+				seen[resolved] = true
+			}
+		}
+	}
+	for _, root := range roots {
+		if info, err := os.Lstat(root.Root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			if resolved, err := filepath.EvalSymlinks(root.Root); err == nil && seen[resolved] {
+				continue
+			}
+		}
+		out = append(out, root)
+	}
+	return out
+}
+
+// chromeAliasesBrowser reports whether Chrome's user data directory is a
+// symlink into browserID's root, in which case "chrome" selects that browser.
+func chromeAliasesBrowser(browserID string) bool {
+	if browserID == "" || browserID == "chrome" || runtime.GOOS != "linux" {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	chromeRoot := filepath.Join(home, ".config/google-chrome")
+	if info, err := os.Lstat(chromeRoot); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(chromeRoot)
+	if err != nil {
+		return false
+	}
+	roots, err := supportedBrowserProfileRoots()
+	if err != nil {
+		return false
+	}
+	for _, root := range roots {
+		if root.BrowserID == browserID {
+			if other, err := filepath.EvalSymlinks(root.Root); err == nil && other == resolved {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func bitBrowserProfileRoots(home string) ([]browserProfileRoot, error) {
@@ -2996,6 +3060,9 @@ func browserSelectorMatches(selector string, info connectedProfileInfo) bool {
 	if info.Target != "" && strings.EqualFold(target, info.Target) {
 		return true
 	}
+	if (strings.EqualFold(target, "chrome") || strings.EqualFold(target, "Google Chrome")) && chromeAliasesBrowser(info.Browser) {
+		return true
+	}
 	return false
 }
 
@@ -3380,7 +3447,11 @@ func defaultNativeHostManifestPathForBrowser(browserSelector string) (string, er
 		}
 		return filepath.Join(root.Root, "NativeMessagingHosts", filename), nil
 	case "linux":
-		return filepath.Join(home, ".config/google-chrome/NativeMessagingHosts", filename), nil
+		root, err := browserRootForInstallSelector(browserSelector)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(root.Root, "NativeMessagingHosts", filename), nil
 	case "windows":
 		localAppData := os.Getenv("LOCALAPPDATA")
 		if strings.TrimSpace(localAppData) == "" {
