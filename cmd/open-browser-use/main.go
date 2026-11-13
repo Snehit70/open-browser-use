@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +98,7 @@ func newRootCommand() *cobra.Command {
 		newWaitLoadCommand(),
 		newPageInfoCommand(),
 		newFramesCommand(),
+		newClickCommand(),
 		newSimpleRPCCommand("ping", "ping", "Ping the browser backend"),
 		newSimpleRPCCommand("info", "getInfo", "Print browser backend info"),
 		newSimpleRPCCommand("tabs", "getTabs", "List session tabs"),
@@ -1599,16 +1601,59 @@ func newRunnerTabCommand(use, short string, run func(*actionRunner, []string) (m
 }
 
 func newWaitLoadCommand() *cobra.Command {
-	return newRunnerTabCommand("wait-load", "Wait until a session tab finishes loading", (*actionRunner).runWaitLoadAction,
+	return newRunnerTabCommand("wait-load", "Wait until a session tab finishes loading (and optionally shows some content)", (*actionRunner).runWaitLoadAction,
 		func(cmd *cobra.Command) func() []string {
-			var state string
+			var state, text, selector string
 			cmd.Flags().StringVar(&state, "state", "load", "load or domcontentloaded")
-			return func() []string { return []string{"--state", state} }
+			cmd.Flags().StringVar(&text, "text", "", "also wait until the page's visible text contains this (for apps that render after load)")
+			cmd.Flags().StringVar(&selector, "selector", "", "also wait until an element matches this CSS selector")
+			return func() []string {
+				out := []string{"--state", state}
+				if text != "" {
+					out = append(out, "--text", text)
+				}
+				if selector != "" {
+					out = append(out, "--selector", selector)
+				}
+				return out
+			}
 		})
 }
 
 func newPageInfoCommand() *cobra.Command {
 	return newRunnerTabCommand("page-info", "Print a session tab's title, URL, ready state, and visible text", (*actionRunner).runPageInfoAction, frameFlag)
+}
+
+func newClickCommand() *cobra.Command {
+	return newRunnerTabCommand("click", "Click an element by --text or --selector (or --x/--y) with a real mouse sequence", (*actionRunner).runClickAction,
+		func(cmd *cobra.Command) func() []string {
+			var selector, text string
+			var x, y float64
+			var index int
+			var double bool
+			cmd.Flags().StringVar(&text, "text", "", "visible text or aria-label of the element (exact match preferred, else substring)")
+			cmd.Flags().StringVar(&selector, "selector", "", "CSS selector of the element")
+			cmd.Flags().IntVar(&index, "index", 0, "which match to click when several match")
+			cmd.Flags().BoolVar(&double, "double", false, "double-click (open files in Drive, select words)")
+			cmd.Flags().Float64Var(&x, "x", -1, "x in CSS pixels, when not using --text/--selector")
+			cmd.Flags().Float64Var(&y, "y", -1, "y in CSS pixels")
+			return func() []string {
+				out := []string{"--index", strconv.Itoa(index)}
+				if text != "" {
+					out = append(out, "--text", text)
+				}
+				if selector != "" {
+					out = append(out, "--selector", selector)
+				}
+				if x >= 0 && y >= 0 {
+					out = append(out, "--x", strconv.FormatFloat(x, 'f', -1, 64), "--y", strconv.FormatFloat(y, 'f', -1, 64))
+				}
+				if double {
+					out = append(out, "--double")
+				}
+				return out
+			}
+		})
 }
 
 func newFramesCommand() *cobra.Command {
@@ -2014,6 +2059,8 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 		return runner.runPageInfoAction(args)
 	case "frames":
 		return runner.runFramesAction(args)
+	case "click":
+		return runner.runClickAction(args)
 	case "cdp":
 		return runner.runCDPAction(args)
 	case "history":
@@ -2104,6 +2151,15 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 	}); err != nil {
 		return nil, 0, err
 	}
+	// With --text/--selector the page only counts as loaded once that content
+	// exists: single-page apps report "complete" before rendering their data.
+	waitExpression := "document.readyState"
+	if text, selector := stringFlag(args, "--text"), stringFlag(args, "--selector"); text != "" || selector != "" {
+		conditions, _ := json.Marshal(map[string]string{"text": text, "selector": selector})
+		waitExpression = `((c) => { const s = document.readyState; if (s === "loading") return s;
+  const ok = (!c.text || (document.body?.innerText ?? "").includes(c.text)) && (!c.selector || document.querySelector(c.selector));
+  return ok ? "complete" : "waiting-content"; })(` + string(conditions) + `)`
+	}
 	deadline := time.Now().Add(runner.options.timeout)
 	var lastErr error
 	for {
@@ -2111,7 +2167,7 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 			"target": map[string]any{"tabId": tabID},
 			"method": "Runtime.evaluate",
 			"commandParams": map[string]any{
-				"expression":    "document.readyState",
+				"expression":    waitExpression,
 				"returnByValue": true,
 			},
 		})
@@ -2121,6 +2177,9 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 		readyState := runtimeEvaluateString(response)
 		if readyState == "complete" || (state == "domcontentloaded" && readyState == "interactive") {
 			return map[string]any{"result": map[string]any{"readyState": readyState}}, tabID, nil
+		}
+		if readyState == "waiting-content" {
+			readyState = "complete, content not yet present"
 		}
 		// Errors mid-navigation (destroyed contexts) are expected; keep polling
 		// but report the last one so a blocked page doesn't look like a slow one.
@@ -2138,6 +2197,147 @@ func (runner *actionRunner) runWaitLoadAction(args []string) (map[string]any, in
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// clickLocateScript finds the click target, scrolls it into view, and reports
+// its center in CSS pixels plus whatever element actually sits on top of it.
+const clickLocateScript = `((opts) => {
+  const visible = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const label = (e) => (e.innerText || e.value || e.getAttribute("aria-label") || e.getAttribute("title") || "").trim();
+  let candidates = [];
+  if (opts.selector) {
+    candidates = [...document.querySelectorAll(opts.selector)].filter(visible);
+  } else {
+    const all = [...document.querySelectorAll("body *")].filter(visible);
+    const exact = all.filter((e) => label(e) === opts.text);
+    candidates = exact.length ? exact : all.filter((e) => label(e).includes(opts.text));
+    // The innermost match is the element the user would click.
+    candidates = candidates.filter((e) => !candidates.some((o) => o !== e && e.contains(o)));
+  }
+  if (!candidates.length) return { error: "no visible element matches " + JSON.stringify(opts.selector || opts.text) };
+  const el = candidates[Math.min(opts.index, candidates.length - 1)];
+  el.scrollIntoView({ block: "center", inline: "center" });
+  const r = el.getBoundingClientRect();
+  const x = r.x + r.width / 2, y = r.y + r.height / 2;
+  const top = document.elementFromPoint(x, y);
+  const describe = (e) => e.tagName.toLowerCase() + (e.id ? "#" + e.id : "") + (e.getAttribute("role") ? "[role=" + e.getAttribute("role") + "]" : "") + " " + JSON.stringify(label(e).slice(0, 60));
+  return {
+    x, y, matches: candidates.length, element: describe(el),
+    ...(top && top !== el && !el.contains(top) && !top.contains(el) ? { obscuredBy: describe(top) } : {})
+  };
+})`
+
+// runClickAction clicks an element found by --selector/--text (or --x/--y) with
+// the full mouse sequence Chrome needs: a double-click is press/release with
+// clickCount 1 then press/release with clickCount 2, which apps like Drive
+// require to open items.
+func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, error) {
+	tabID, err := tabIDArgOrCurrent(args, runner.currentTabID)
+	if err != nil {
+		return nil, 0, err
+	}
+	selector, text := stringFlag(args, "--selector"), stringFlag(args, "--text")
+	double := hasArg(args, "--double")
+	index, _ := intFlag(args, "--index")
+	if err := runner.attach(tabID); err != nil {
+		return nil, 0, err
+	}
+	cdp := func(method string, params map[string]any) (map[string]any, error) {
+		response, _, err := runner.invoke("executeCdp", map[string]any{
+			"target": tabTarget(tabID, ""), "method": method, "commandParams": params,
+			"timeoutMs": cdpTimeoutMs(runner.options.timeout),
+		})
+		if err == nil {
+			err = rpcError(response)
+		}
+		return response, err
+	}
+	target := map[string]any{}
+	switch {
+	case selector != "" || text != "":
+		opts, _ := json.Marshal(map[string]any{"selector": selector, "text": text, "index": index})
+		response, err := cdp("Runtime.evaluate", map[string]any{
+			"expression":    clickLocateScript + "(" + string(opts) + ")",
+			"returnByValue": true,
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+		result, _ := response["result"].(map[string]any)
+		inner, _ := result["result"].(map[string]any)
+		value, _ := inner["value"].(map[string]any)
+		if value == nil {
+			return nil, 0, fmt.Errorf("click: could not locate element: %v", result)
+		}
+		if message, ok := value["error"].(string); ok {
+			return nil, 0, fmt.Errorf("click: %s", message)
+		}
+		target = value
+	default:
+		xs, ys := stringFlag(args, "--x"), stringFlag(args, "--y")
+		x, errX := strconv.ParseFloat(xs, 64)
+		y, errY := strconv.ParseFloat(ys, 64)
+		if errX != nil || errY != nil {
+			return nil, 0, errors.New("click requires --selector, --text, or --x and --y (CSS pixels)")
+		}
+		target = map[string]any{"x": x, "y": y}
+	}
+	before := runner.sessionTabIDs()
+	x, y := target["x"], target["y"]
+	if _, err := cdp("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y}); err != nil {
+		return nil, 0, err
+	}
+	clicks := 1
+	if double {
+		clicks = 2
+	}
+	for count := 1; count <= clicks; count++ {
+		for _, kind := range []string{"mousePressed", "mouseReleased"} {
+			if _, err := cdp("Input.dispatchMouseEvent", map[string]any{
+				"type": kind, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": count,
+			}); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	// Report tabs the click opened so the caller doesn't have to diff tab lists.
+	time.Sleep(clickSettleDelay)
+	var opened []int
+	for _, id := range runner.sessionTabIDs() {
+		if !slices.Contains(before, id) {
+			opened = append(opened, id)
+		}
+	}
+	if len(opened) > 0 {
+		target["openedTabIds"] = opened
+	}
+	if _, ok := target["obscuredBy"]; ok {
+		target["warning"] = "another element covers the target (a dialog, overlay, or preview?); take a screenshot to check"
+	}
+	return map[string]any{"result": target}, tabID, nil
+}
+
+const clickSettleDelay = 1200 * time.Millisecond
+
+func (runner *actionRunner) sessionTabIDs() []int {
+	response, _, err := runner.invoke("getTabs", map[string]any{})
+	if err != nil {
+		return nil
+	}
+	tabs, _ := response["result"].([]any)
+	var ids []int
+	for _, raw := range tabs {
+		if tab, ok := raw.(map[string]any); ok {
+			if id, ok := numberAsInt(tab["id"]); ok {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+func hasArg(args []string, name string) bool {
+	return slices.Contains(args, name)
 }
 
 func (runner *actionRunner) runFramesAction(args []string) (map[string]any, int, error) {
@@ -2605,7 +2805,12 @@ func invokeWithProfile(socketPath string, socketDir string, browser string, prof
 	if err := wire.WriteJSON(conn, request); err != nil {
 		return nil, err
 	}
-	return readResponseForID(conn, requestID)
+	response, err := readResponseForID(conn, requestID)
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return nil, fmt.Errorf("no reply from the browser to %s within %s; the page or browser may be busy (first call after the browser wakes can be slow). Retry, or pass a longer --timeout such as 30s", method, timeout)
+	}
+	return response, err
 }
 
 func readResponseForID(conn net.Conn, requestID string) (map[string]any, error) {
