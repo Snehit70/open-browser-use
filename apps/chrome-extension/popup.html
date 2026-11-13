@@ -9,40 +9,45 @@
   <body>
     <main class="popup">
       <header class="top">
-        <img src="icons/icon-32.png" width="20" height="20" alt="" />
-        <h1>Open Browser Use <span id="version" class="muted"></span></h1>
-        <span class="status" id="status" data-state="unknown">
+        <img class="logo" src="icons/icon-32.png" width="18" height="18" alt="" />
+        <h1>Open Browser Use</h1>
+        <button type="button" class="status" id="status" data-state="unknown" disabled>
           <span class="dot" aria-hidden="true"></span><span id="status-label">Checking</span>
-        </span>
+        </button>
       </header>
 
-      <section class="offline" id="offline" hidden>
-        <p class="offline-title" id="offline-title">Agents can't reach this profile.</p>
-        <p class="offline-error" id="offline-error" hidden></p>
-        <div class="row">
-          <button type="button" class="btn primary" id="reconnect">Reconnect</button>
-          <span class="muted small">Still failing? Run <code>open-browser-use setup</code></span>
+      <div class="offline" id="offline" role="status" hidden>
+        <span class="offline-text">
+          <strong id="offline-title">Can't reach the CLI</strong>
+          <span class="mono muted" id="offline-error"></span>
+        </span>
+        <button type="button" class="btn sm" id="reconnect">Retry</button>
+      </div>
+
+      <section class="here" id="here" aria-label="This tab"></section>
+
+      <section id="tasks-section" aria-labelledby="tasks-heading">
+        <div class="section-head">
+          <h2 id="tasks-heading">Agents</h2>
+          <span class="count" id="task-count"></span>
         </div>
+        <div class="stack" id="tasks"></div>
       </section>
 
-      <section aria-labelledby="tab-heading">
-        <h2 id="tab-heading">This tab</h2>
-        <div class="card" id="current-tab"></div>
+      <section id="results-section" aria-labelledby="results-heading" hidden>
+        <div class="section-head">
+          <h2 id="results-heading">Results</h2>
+          <span class="count" id="result-count"></span>
+        </div>
+        <div class="card list" id="results"></div>
       </section>
 
-      <section aria-labelledby="tasks-heading">
-        <h2 id="tasks-heading">Agent tasks <span class="count" id="task-count"></span></h2>
-        <div id="tasks"></div>
-      </section>
-
-      <footer class="settings">
-        <label class="toggle">
-          <span>
-            <span class="toggle-title">WebMCP page tools</span>
-            <span class="muted small">Let agents call tools that websites expose.</span>
-          </span>
+      <footer class="foot">
+        <label class="switch" title="Let agents call tools that websites expose (WebMCP)">
           <input type="checkbox" id="webmcp" role="switch" />
+          <span>Page tools</span>
         </label>
+        <span class="mono muted" id="version"></span>
       </footer>
     </main>
     <script src="popup.js"></script>

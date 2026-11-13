@@ -25,9 +25,13 @@ function createChromeFake() {
     tabs: new Map([
       [1, { id: 1, groupId: 9, title: "A", url: "https://a.test/" }],
       [2, { id: 2, groupId: 9, title: "B", url: "https://b.test/" }],
-      [3, { id: 3, groupId: -1, title: "C", url: "https://c.test/" }]
+      [3, { id: 3, groupId: -1, title: "C", url: "https://c.test/" }],
+      [4, { id: 4, groupId: 5, title: "Done", url: "https://d.test/", windowId: 1 }]
     ]),
-    groups: new Map([[9, { id: 9, title: "Task - OBU", windowId: 1 }]]),
+    groups: new Map([
+      [9, { id: 9, title: "Task - OBU", windowId: 1 }],
+      [5, { id: 5, title: "✅ Open Browser Use", windowId: 1 }]
+    ]),
     detached: []
   };
   const chrome = {
@@ -59,6 +63,9 @@ function createChromeFake() {
           throw new Error("No group");
         }
         return state.groups.get(id);
+      },
+      async query({ title }) {
+        return [...state.groups.values()].filter((group) => group.title === title);
       },
       async update() {}
     },
@@ -103,7 +110,12 @@ async function run() {
       snapshot.sessions[0].tabs.map((tab) => [tab.id, tab.controlled, tab.agentActive]),
       [[1, true, true], [2, false, false]]
     );
-    console.log("test 1 ok: popupState lists live sessions with controlled tabs");
+    assert.deepEqual(snapshot.results.map((tab) => tab.id), [4], "finished tabs show as results");
+    assert.equal(snapshot.sessions[0].lastActivity, null);
+    await backend.requireSession({ session_id: "s1", turn_id: "t" });
+    const after = await backend.popupState();
+    assert.ok(Date.now() - after.sessions[0].lastActivity < 1000, "agent calls update lastActivity");
+    console.log("test 1 ok: popupState lists sessions, results, and agent activity");
   }
   {
     const { backend, state } = await loadBackend();

@@ -214,7 +214,8 @@ class SessionStore {
       chromeGroupId: null,
       title: DEFAULT_SESSION_GROUP_TITLE,
       activeTabId: null,
-      tabOrigins: {}
+      tabOrigins: {},
+      createdAt: Date.now()
     };
     this.state.sessions[sessionId] = created;
     await this.save();
@@ -302,6 +303,7 @@ class BrowserBackend {
     this.webMcpGate = webMcpGate;
     this.attachedTabs = new Set();
     this.activeTabsBySession = new Map();
+    this.lastActivityBySession = new Map();
     this.cursorByTabId = new Map();
     this.downloadFilenamesById = new Map();
     this.downloadUrlsById = new Map();
@@ -1128,6 +1130,8 @@ class BrowserBackend {
         title: group.title || session.title,
         groupId: session.chromeGroupId,
         windowId: group.windowId,
+        createdAt: typeof session.createdAt === "number" ? session.createdAt : null,
+        lastActivity: this.lastActivityBySession.get(sessionId) ?? null,
         tabs: tabs.filter(hasTabId).map((tab) => ({
           id: tab.id,
           title: tab.title,
@@ -1138,9 +1142,19 @@ class BrowserBackend {
         }))
       });
     }
+    // Tabs agents handed back when they finished (moveToDeliverables).
+    const resultGroups = await chrome.tabGroups.query({ title: DELIVERABLE_GROUP_TITLE }).catch(() => []);
+    const results = [];
+    for (const group of resultGroups) {
+      const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+      for (const tab of tabs.filter(hasTabId)) {
+        results.push({ id: tab.id, title: tab.title, url: tab.url, favIconUrl: tab.favIconUrl, windowId: tab.windowId });
+      }
+    }
     return {
       webMcpEnabled: (await this.webMcpGate?.enabled?.()) === true,
-      sessions
+      sessions,
+      results
     };
   }
 
@@ -1173,6 +1187,7 @@ class BrowserBackend {
       }
     }
     this.activeTabsBySession.delete(sessionId);
+    this.lastActivityBySession.delete(sessionId);
     await this.store.removeSession(sessionId);
   }
 
@@ -1234,6 +1249,7 @@ class BrowserBackend {
       throw new Error("Missing required browser turn_id");
     }
     await this.store.getSession(params.session_id);
+    this.lastActivityBySession.set(params.session_id, Date.now());
     return { sessionId: params.session_id, turnId: params.turn_id };
   }
 
