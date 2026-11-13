@@ -7,61 +7,43 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <main class="popup-shell">
-      <header class="popup-header">
-        <img src="icons/icon-128.png" width="32" height="32" alt="" class="app-icon" />
-        <div class="title-block">
-          <h1>Open Browser Use</h1>
-          <p class="subtitle">Chrome automation bridge</p>
-        </div>
-        <span class="version-pill" id="extension-version" aria-label="Extension version"></span>
+    <main class="popup">
+      <header class="top">
+        <img src="icons/icon-32.png" width="20" height="20" alt="" />
+        <h1>Open Browser Use <span id="version" class="muted"></span></h1>
+        <span class="status" id="status" data-state="unknown">
+          <span class="dot" aria-hidden="true"></span><span id="status-label">Checking</span>
+        </span>
       </header>
 
-      <section class="panel" aria-labelledby="connection-title">
-        <div class="section-heading">
-          <span class="eyebrow" id="connection-title">Connection</span>
-          <span class="status-pill" id="status-pill">
-            <span class="status-dot" aria-hidden="true"></span>
-            <span id="status-label">Checking</span>
+      <section class="offline" id="offline" hidden>
+        <p class="offline-title" id="offline-title">Agents can't reach this profile.</p>
+        <p class="offline-error" id="offline-error" hidden></p>
+        <div class="row">
+          <button type="button" class="btn primary" id="reconnect">Reconnect</button>
+          <span class="muted small">Still failing? Run <code>open-browser-use setup</code></span>
+        </div>
+      </section>
+
+      <section aria-labelledby="tab-heading">
+        <h2 id="tab-heading">This tab</h2>
+        <div class="card" id="current-tab"></div>
+      </section>
+
+      <section aria-labelledby="tasks-heading">
+        <h2 id="tasks-heading">Agent tasks <span class="count" id="task-count"></span></h2>
+        <div id="tasks"></div>
+      </section>
+
+      <footer class="settings">
+        <label class="toggle">
+          <span>
+            <span class="toggle-title">WebMCP page tools</span>
+            <span class="muted small">Let agents call tools that websites expose.</span>
           </span>
-        </div>
-        <p class="status-message" id="status-message">Checking native host...</p>
-        <dl class="status-details">
-          <div>
-            <dt>Native host</dt>
-            <dd id="host-name">com.ifuryst.open_browser_use.extension</dd>
-          </div>
-          <div>
-            <dt>Last checked</dt>
-            <dd id="last-checked">Now</dd>
-          </div>
-        </dl>
-        <p class="error-message" id="error-message" hidden></p>
-      </section>
-
-      <section class="panel" aria-labelledby="cli-title">
-        <div class="section-heading">
-          <span class="eyebrow" id="cli-title">CLI Install</span>
-          <span class="platform-pill" id="platform-label">Detecting OS</span>
-        </div>
-        <div class="command-list" id="cli-commands" aria-live="polite"></div>
-      </section>
-
-      <section class="panel repo-panel" aria-labelledby="repo-title">
-        <div>
-          <span class="eyebrow" id="repo-title">GitHub</span>
-          <p class="repo-copy">Open source repo, setup notes, and SDK packages.</p>
-        </div>
-        <a
-          class="repo-link"
-          id="repo-link"
-          href="https://github.com/iFurySt/open-browser-use"
-          target="_blank"
-          rel="noreferrer"
-        >
-          View repo
-        </a>
-      </section>
+          <input type="checkbox" id="webmcp" role="switch" />
+        </label>
+      </footer>
     </main>
     <script src="popup.js"></script>
   </body>

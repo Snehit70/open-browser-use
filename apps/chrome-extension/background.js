@@ -1106,6 +1106,76 @@ class BrowserBackend {
     return result.result?.value;
   }
 
+  // Popup support: a snapshot of live agent sessions and user kill switches.
+  async popupState() {
+    await this.store.ready;
+    const sessions = [];
+    for (const [sessionId, session] of Object.entries(this.store.state.sessions)) {
+      if (typeof session?.chromeGroupId !== "number") {
+        continue;
+      }
+      const group = await chrome.tabGroups.get(session.chromeGroupId).catch(() => null);
+      if (!group) {
+        continue;
+      }
+      const tabs = await chrome.tabs.query({ groupId: session.chromeGroupId }).catch(() => []);
+      if (tabs.length === 0) {
+        continue;
+      }
+      const activeTabId = this.activeTabsBySession.get(sessionId) ?? session.activeTabId;
+      sessions.push({
+        sessionId,
+        title: group.title || session.title,
+        groupId: session.chromeGroupId,
+        windowId: group.windowId,
+        tabs: tabs.filter(hasTabId).map((tab) => ({
+          id: tab.id,
+          title: tab.title,
+          url: tab.url,
+          favIconUrl: tab.favIconUrl,
+          controlled: this.attachedTabs.has(tab.id),
+          agentActive: tab.id === activeTabId
+        }))
+      });
+    }
+    return {
+      webMcpEnabled: (await this.webMcpGate?.enabled?.()) === true,
+      sessions
+    };
+  }
+
+  async releaseTab(tabId) {
+    await this.store.ready;
+    await this.detachTab(tabId).catch(() => {});
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && typeof tab.groupId === "number" && tab.groupId !== -1) {
+      const owner = await this.store.findSessionByGroup(tab.groupId);
+      if (owner) {
+        await chrome.tabs.ungroup(tabId).catch(() => {});
+        delete owner.session.tabOrigins?.[String(tabId)];
+        await this.store.save();
+      }
+    }
+  }
+
+  async endSession(sessionId) {
+    await this.store.ready;
+    const session = this.store.state.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    if (typeof session.chromeGroupId === "number") {
+      const tabs = await chrome.tabs.query({ groupId: session.chromeGroupId }).catch(() => []);
+      const ids = tabs.filter(hasTabId).map((tab) => tab.id);
+      await this.detachMany(ids).catch(() => {});
+      if (ids.length > 0) {
+        await chrome.tabs.ungroup(ids).catch(() => {});
+      }
+    }
+    this.activeTabsBySession.delete(sessionId);
+    await this.store.removeSession(sessionId);
+  }
+
   async ensureSessionGroup(sessionId, tabId, origin) {
     const session = await this.store.getSession(sessionId);
     let groupId = session.chromeGroupId;
@@ -1589,6 +1659,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_NATIVE_HOST_STATUS") {
     const status = transport.getStatus();
     sendResponse({ ok: status.state === "connected", status, error: status.error });
+    return true;
+  }
+  if (message?.type === "GET_POPUP_STATE") {
+    backend.popupState().then(
+      (state) => sendResponse({ ok: true, status: transport.getStatus(), ...state }),
+      (error) =>
+        sendResponse({ ok: false, status: transport.getStatus(), error: String(error?.message ?? error) })
+    );
+    return true;
+  }
+  if (message?.type === "POPUP_ACTION" && sender.id === chrome.runtime.id && !sender.tab) {
+    const run = async () => {
+      if (message.action === "reconnect") {
+        transport.connect();
+      } else if (message.action === "releaseTab" && Number.isInteger(message.tabId)) {
+        await backend.releaseTab(message.tabId);
+      } else if (message.action === "endSession" && typeof message.sessionId === "string") {
+        await backend.endSession(message.sessionId);
+      } else {
+        throw new Error("Unknown popup action");
+      }
+    };
+    run().then(
+      () => sendResponse({ ok: true }),
+      (error) => sendResponse({ ok: false, error: String(error?.message ?? error) })
+    );
     return true;
   }
   if (message?.type === "GET_OPEN_BROWSER_USE_CURSOR_STATE") {
