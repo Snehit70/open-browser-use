@@ -2419,7 +2419,8 @@ const clickSettleDelay = 1200 * time.Millisecond
 // scrollChainJS returns the elements a wheel at the viewport center could
 // scroll: the page, body, and the composed-tree ancestors of the element
 // there, descending into open shadow roots. opaque is set when that element
-// is a frame or plugin whose own scrolling the top document cannot see.
+// is a frame, plugin, or closed shadow host (a custom element hit directly,
+// with no open shadow root) whose own scrolling the top document cannot see.
 const scrollChainJS = `(() => {
   const x = innerWidth / 2, y = innerHeight / 2;
   const page = document.scrollingElement || document.documentElement;
@@ -2430,7 +2431,7 @@ const scrollChainJS = `(() => {
     if (!inner || inner === el) break;
     el = inner;
   }
-  const opaque = !!el && /^(IFRAME|FRAME|OBJECT|EMBED)$/.test(el.tagName);
+  const opaque = !!el && (/^(IFRAME|FRAME|OBJECT|EMBED)$/.test(el.tagName) || (el.tagName.includes("-") && !el.shadowRoot));
   while (el) {
     chain.add(el);
     const root = el.getRootNode();
@@ -2447,7 +2448,13 @@ const scrollStateScript = `((selector) => {
   const reg = (window.__obuScroll ??= { ids: new WeakMap(), next: 0 });
   const { page, chain, opaque } = ` + scrollChainJS + `();
   const positions = {}, labels = {};
-  let height = 0;
+  let height = 0, roomDown = false, roomUp = false, pageScrolls = false;
+  for (const el of [page, document.body]) {
+    if (!el || /^(hidden|clip)$/.test(getComputedStyle(el).overflowY)) continue;
+    if (el.scrollHeight > el.clientHeight + 1) pageScrolls = true;
+    if (el.scrollHeight - el.clientHeight - el.scrollTop >= 1) roomDown = true;
+    if (el.scrollTop >= 1) roomUp = true;
+  }
   for (const el of chain) {
     if (!el || el.scrollHeight <= el.clientHeight + 1) continue;
     let id = reg.ids.get(el);
@@ -2457,7 +2464,7 @@ const scrollStateScript = `((selector) => {
     height += el.scrollHeight;
   }
   return {
-    positions, labels, height, opaque, visibilityState: document.visibilityState,
+    positions, labels, height, opaque, roomDown, roomUp, pageScrolls, visibilityState: document.visibilityState,
     viewport: [innerWidth, innerHeight],
     ...(selector ? { count: document.querySelectorAll(selector).length } : {})
   };
@@ -2631,9 +2638,15 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 			return nil, 0, err
 		}
 		progressed := track(previous, after) || grew(previous, after)
-		if !progressed && after["opaque"] == true {
+		pageRoom := after["roomDown"] == true
+		if pixels < 0 {
+			pageRoom = after["roomUp"] == true
+		}
+		if !progressed && after["opaque"] == true && (pageRoom || after["pageScrolls"] != true) {
 			// The wheel lands in a frame or plugin the top document cannot
-			// measure; keep going blind rather than calling it the end.
+			// measure, and the page is not simply at its end (it has room,
+			// or it does not scroll at all, as in a full-page frame app):
+			// keep going blind rather than calling it the end.
 			blind, progressed = true, true
 		}
 		if !progressed {
@@ -2703,7 +2716,7 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 	}
 	result := map[string]any{"steps": steps, "stopped": stopped, "input": input, "before": summary(before), "after": summary(after)}
 	if blind {
-		result["warning"] = "the center of the tab is an iframe or plugin that scroll cannot measure, so it ran without detecting the end; check the result with page-info or a screenshot, or scroll inside the frame with cdp"
+		result["warning"] = "the center of the tab is an iframe, plugin, or closed shadow root that scroll cannot measure, so it ran without detecting the end; check the result with page-info or a screenshot, or scroll inside the frame with cdp"
 	}
 	if scroller != "" {
 		result["scroller"] = scroller

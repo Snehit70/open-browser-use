@@ -153,6 +153,7 @@ func TestScrollKeepsGoingOverOpaqueFrame(t *testing.T) {
 	socketPath, deltas, _ := scrollFakeWithNudge(t, "agent", func(int) map[string]any {
 		s := page(map[string]any{"1": 0.0}, 900)
 		s["opaque"] = true
+		s["roomDown"] = true
 		return s
 	}, func(int) bool { nudges++; return true })
 	if err := run(scrollArgs(socketPath, "--times", "4")); err != nil {
@@ -255,5 +256,23 @@ func TestScrollByStepsBackBeforeGivingUp(t *testing.T) {
 	}
 	if nudges[len(nudges)-1] != 2000 || nudges[len(nudges)-2] != -2000 {
 		t.Fatalf("a step back should be followed by a step down, got %v", nudges)
+	}
+}
+
+// An iframe at the center once the page has reached its end (an embed at the
+// bottom of an article) must not keep the scroll going.
+func TestScrollStopsOverOpaqueFrameAtPageEnd(t *testing.T) {
+	socketPath, deltas, _ := scrollFake(t, "agent", func(int) map[string]any {
+		s := page(map[string]any{"1": 3000.0}, 4000)
+		s["opaque"] = true
+		s["roomDown"] = false
+		s["pageScrolls"] = true
+		return s
+	})
+	if err := run(scrollArgs(socketPath, "--times", "6")); err != nil {
+		t.Fatal(err)
+	}
+	if len(*deltas) != 1 {
+		t.Fatalf("page at its end: want 1 wheel, got %d", len(*deltas))
 	}
 }
