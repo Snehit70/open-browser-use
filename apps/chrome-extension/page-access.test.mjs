@@ -49,6 +49,7 @@ function createChromeFake() {
     },
     tabs: {
       async get(id) {
+        if (state.slowGet?.[id]) await new Promise((resolve) => setTimeout(resolve, state.slowGet[id]));
         if (!state.tabs.has(id)) throw new Error("No tab");
         return { ...state.tabs.get(id) };
       },
@@ -138,12 +139,43 @@ async function run() {
     const { backend, state } = await loadBackend();
     await cdp(backend, 1, "Runtime.evaluate");
     assert.ok(state.sent.includes("Page.enable"), "attach enables Page events");
-    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "attach makes background tabs act focused");
+    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "attach makes agent tabs act focused");
+    backend.store.state.sessions.s1.tabOrigins[3] = "user";
+    state.tabs.get(3).groupId = 9;
+    state.sent.length = 0;
+    await cdp(backend, 3, "Runtime.evaluate");
+    assert.ok(!state.sent.includes("Emulation.setFocusEmulationEnabled"), "a tab claimed from the user keeps real focus state");
     backend.handleCdpEvent({ tabId: 1 }, "Page.javascriptDialogOpening", { type: "alert", message: "Hi there" });
     await assert.rejects(cdp(backend, 1, "Runtime.evaluate"), /blocked by a JavaScript alert dialog: "Hi there".*handleJavaScriptDialog/);
     await cdp(backend, 1, "Page.handleJavaScriptDialog");
     assert.deepEqual(await cdp(backend, 1, "Runtime.evaluate"), { ok: "Runtime.evaluate", active: false });
     console.log("test 1 ok: open dialog fails fast with a fix, and handling it clears the block");
+  }
+  {
+    const { backend, state } = await loadBackend();
+    state.tabs.set(6, { id: 6, groupId: 9, windowId: 1, openerTabId: 1, url: "https://spawned.test/" });
+    state.slowGet = { 1: 30 }; // the opener lookup in recordSpawnedTab is slow
+    state.onCreated(state.tabs.get(6));
+    // No await between the tab appearing and the first command: the spawn
+    // record must land before attach decides on focus emulation.
+    await cdp(backend, 6, "Runtime.evaluate");
+    assert.ok(state.sent.includes("Emulation.setFocusEmulationEnabled"), "a link-spawned tab gets focus emulation");
+    // Two commands racing on a fresh spawned tab: the second must not run
+    // before the first finished setting the tab up.
+    state.tabs.set(7, { id: 7, groupId: 9, windowId: 1, openerTabId: 1, url: "https://spawned2.test/" });
+    state.onCreated(state.tabs.get(7));
+    state.targets.length = 0;
+    const first = cdp(backend, 7, "Runtime.evaluate");
+    await new Promise((resolve) => setTimeout(resolve, 10)); // first is mid-setup (spawn lookup takes 30ms)
+    await Promise.all([first, cdp(backend, 7, "DOM.enable")]);
+    const order = state.targets.filter((t) => t.tabId === 7).map((t) => t.method);
+    assert.ok(
+      order.indexOf("Emulation.setFocusEmulationEnabled") < order.indexOf("DOM.enable"),
+      `setup runs before a parallel command: ${order.join(", ")}`
+    );
+    const tabs = await backend.getTabs({ session_id: "s1", turn_id: "t" });
+    assert.equal(tabs.find((tab) => tab.id === 6)?.origin, "agent", "getTabs reports tab origin");
+    console.log("test 1b ok: spawned tabs are known as agent tabs before first attach; getTabs reports origin");
   }
   {
     const { backend, state } = await loadBackend();
