@@ -2419,8 +2419,9 @@ const clickSettleDelay = 1200 * time.Millisecond
 // scrollChainJS returns the elements a wheel at the viewport center could
 // scroll: the page, body, and the composed-tree ancestors of the element
 // there, descending into open shadow roots. opaque is set when that element
-// is a frame, plugin, or closed shadow host (a custom element hit directly,
-// with no open shadow root) whose own scrolling the top document cannot see.
+// is a frame, plugin, or likely closed shadow host (a custom element hit
+// directly, with no open shadow root and no scroller around it) whose own
+// scrolling the top document cannot see.
 const scrollChainJS = `(() => {
   const x = innerWidth / 2, y = innerHeight / 2;
   const page = document.scrollingElement || document.documentElement;
@@ -2431,13 +2432,18 @@ const scrollChainJS = `(() => {
     if (!inner || inner === el) break;
     el = inner;
   }
-  const opaque = !!el && (/^(IFRAME|FRAME|OBJECT|EMBED)$/.test(el.tagName) || (el.tagName.includes("-") && !el.shadowRoot));
+  const frame = !!el && /^(IFRAME|FRAME|OBJECT|EMBED)$/.test(el.tagName);
+  const maybeClosedHost = !!el && el.tagName.includes("-") && !el.shadowRoot;
   while (el) {
     chain.add(el);
     const root = el.getRootNode();
     el = el.assignedSlot || el.parentElement || (root instanceof ShadowRoot ? root.host : null);
   }
-  return { page, chain, opaque };
+  // A custom element with no open shadow root may hide a closed one; only
+  // treat it as unmeasurable when nothing around it scrolls either.
+  const innerScroller = [...chain].some((node) => node !== page && node !== document.body &&
+    node.scrollHeight > node.clientHeight + 1 && /^(auto|scroll|overlay)$/.test(getComputedStyle(node).overflowY));
+  return { page, chain, opaque: frame || (maybeClosedHost && !innerScroller) };
 })`
 
 // scrollStateScript snapshots every scrollable element that a wheel at the
