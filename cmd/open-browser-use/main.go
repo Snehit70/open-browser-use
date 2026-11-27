@@ -101,6 +101,9 @@ func newRootCommand() *cobra.Command {
 		newFramesCommand(),
 		newClickCommand(),
 		newScrollCommand(),
+		newScreenshotCommand(),
+		newKeyCommand(),
+		newPasteCommand(),
 		newSimpleRPCCommand("ping", "ping", "Ping the browser backend"),
 		newSimpleRPCCommand("info", "getInfo", "Print browser backend info"),
 		newSimpleRPCCommand("tabs", "getTabs", "List session tabs"),
@@ -1293,6 +1296,7 @@ func newHistoryCommand() *cobra.Command {
 func newClaimTabCommand() *cobra.Command {
 	var options socketOptions
 	var tabID int
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "claim-tab",
 		Short: "Claim an existing Chrome tab",
@@ -1301,11 +1305,16 @@ func newClaimTabCommand() *cobra.Command {
 			if tabID <= 0 {
 				return errors.New("claim-tab requires --tab-id")
 			}
-			return invokeAndWrite(options, "claimUserTab", map[string]any{"tabId": tabID})
+			params := map[string]any{"tabId": tabID}
+			if force {
+				params["force"] = true
+			}
+			return invokeAndWrite(options, "claimUserTab", params)
 		},
 	}
 	addSocketFlags(cmd, &options)
 	cmd.Flags().IntVar(&tabID, "tab-id", 0, "Chrome tab id to claim")
+	cmd.Flags().BoolVar(&force, "force", false, "take the tab over from another session (one that was interrupted); user-tabs shows the owning sessionId")
 	return cmd
 }
 
@@ -1354,6 +1363,7 @@ func newCdpCommand() *cobra.Command {
 	var frame string
 	var method string
 	var commandParamsJSON string
+	var out string
 	cmd := &cobra.Command{
 		Use:   "cdp",
 		Short: "Run a Chrome DevTools Protocol command",
@@ -1376,7 +1386,11 @@ func newCdpCommand() *cobra.Command {
 			}
 			if tabID > 0 {
 				target = tabTarget(tabID, frame)
-				if err := attachTab(options, tabID); err != nil {
+				fallbackMethod := method
+				if frame != "" {
+					fallbackMethod = ""
+				}
+				if err := attachTabFor(options, tabID, fallbackMethod); err != nil {
 					return err
 				}
 			}
@@ -1402,6 +1416,25 @@ func newCdpCommand() *cobra.Command {
 					return err
 				}
 			}
+			if out != "" {
+				// Large results (long strings, screenshots) go to a file so
+				// nothing between the CLI and the caller can truncate them.
+				raw, err := json.MarshalIndent(response, "", "  ")
+				if err != nil {
+					return err
+				}
+				if err := os.WriteFile(out, raw, 0o644); err != nil {
+					return err
+				}
+				summary := map[string]any{"out": out, "bytes": len(raw)}
+				if rpcErr := rpcError(response); rpcErr != nil {
+					summary["error"] = rpcErr.Error()
+				}
+				if err := writeJSON(summary); err != nil {
+					return err
+				}
+				return rpcError(response)
+			}
 			if err := writeJSON(response); err != nil {
 				return err
 			}
@@ -1409,6 +1442,7 @@ func newCdpCommand() *cobra.Command {
 		},
 	}
 	addSocketFlags(cmd, &options)
+	cmd.Flags().StringVar(&out, "out", "", "write the full JSON response to this file and print only a short summary")
 	cmd.Flags().IntVar(&tabID, "tab-id", 0, "optional tab id target")
 	cmd.Flags().StringVar(&frame, "frame", "", "run inside a cross-origin iframe: URL substring or session id from `frames`")
 	cmd.Flags().StringVar(&method, "method", "", "Chrome DevTools Protocol method")
@@ -1498,12 +1532,17 @@ func newSetFileChooserFilesCommand() *cobra.Command {
 func newOpenTabCommand() *cobra.Command {
 	var options socketOptions
 	var url string
+	var newWindow bool
 	cmd := &cobra.Command{
 		Use:   "open-tab",
 		Short: "Open a new browser session tab",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			tabResponse, err := invokeWithOptions(options, "createTab", map[string]any{})
+			createParams := map[string]any{}
+			if newWindow {
+				createParams["newWindow"] = true
+			}
+			tabResponse, err := invokeWithOptions(options, "createTab", createParams)
 			if err != nil {
 				return err
 			}
@@ -1514,7 +1553,7 @@ func newOpenTabCommand() *cobra.Command {
 			}
 			output := map[string]any{"tab": result}
 			if url != "" {
-				if err := attachTab(options, tabID); err != nil {
+				if err := attachTabFor(options, tabID, "Page.navigate"); err != nil {
 					return err
 				}
 				navigateResponse, err := invokeWithOptions(options, "executeCdp", map[string]any{
@@ -1532,6 +1571,7 @@ func newOpenTabCommand() *cobra.Command {
 	}
 	addSocketFlags(cmd, &options)
 	cmd.Flags().StringVar(&url, "url", "", "optional URL to navigate after tab creation")
+	cmd.Flags().BoolVar(&newWindow, "new-window", false, "open the session's tabs in their own unfocused window, so screenshots never flash over the user's tab (only on the session's first tab)")
 	return cmd
 }
 
@@ -1550,7 +1590,7 @@ func newNavigateCommand() *cobra.Command {
 			if url == "" {
 				return errors.New("navigate requires --url")
 			}
-			if err := attachTab(options, tabID); err != nil {
+			if err := attachTabFor(options, tabID, "Page.navigate"); err != nil {
 				return err
 			}
 			return invokeAndWrite(options, "executeCdp", map[string]any{
@@ -2137,11 +2177,17 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 	case "open-tab":
 		return runner.runOpenTabAction(args)
 	case "claim-tab":
+		force := hasArg(args, "--force")
+		args = withoutArgs(args, "--force")
 		tabID, err := firstIntArg(args, "--tab-id")
 		if err != nil {
 			return nil, 0, fmt.Errorf("claim-tab requires tab id: %w", err)
 		}
-		response, _, err := runner.invoke("claimUserTab", map[string]any{"tabId": tabID})
+		params := map[string]any{"tabId": tabID}
+		if force {
+			params["force"] = true
+		}
+		response, _, err := runner.invoke("claimUserTab", params)
 		if err == nil {
 			runner.currentTabID = tabID
 		}
@@ -2158,6 +2204,12 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 		return runner.runClickAction(args)
 	case "scroll":
 		return runner.runScrollAction(args)
+	case "screenshot":
+		return runner.runScreenshotAction(args)
+	case "key":
+		return runner.runKeyAction(args)
+	case "paste":
+		return runner.runPasteAction(args)
 	case "cdp":
 		return runner.runCDPAction(args)
 	case "history":
@@ -2178,8 +2230,12 @@ func (runner *actionRunner) runAction(action string, args []string) (map[string]
 }
 
 func (runner *actionRunner) runOpenTabAction(args []string) (map[string]any, int, error) {
-	url := firstStringArg(args, "--url")
-	response, _, err := runner.invoke("createTab", map[string]any{})
+	createParams := map[string]any{}
+	if hasArg(args, "--new-window") {
+		createParams["newWindow"] = true
+	}
+	url := firstStringArg(withoutArgs(args, "--new-window"), "--url")
+	response, _, err := runner.invoke("createTab", createParams)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2191,7 +2247,7 @@ func (runner *actionRunner) runOpenTabAction(args []string) (map[string]any, int
 	runner.currentTabID = tabID
 	output := map[string]any{"tab": result}
 	if url != "" {
-		if err := runner.attach(tabID); err != nil {
+		if err := runner.attachFor(tabID, "Page.navigate"); err != nil {
 			return nil, 0, err
 		}
 		navigate, _, err := runner.invoke("executeCdp", map[string]any{
@@ -2216,7 +2272,7 @@ func (runner *actionRunner) runNavigateAction(args []string) (map[string]any, in
 	if url == "" {
 		return nil, 0, errors.New("navigate requires a URL")
 	}
-	if err := runner.attach(tabID); err != nil {
+	if err := runner.attachFor(tabID, "Page.navigate"); err != nil {
 		return nil, 0, err
 	}
 	return runner.invoke("executeCdp", map[string]any{
@@ -2379,8 +2435,11 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 		}
 		target = map[string]any{"x": x, "y": y}
 	}
-	before := runner.sessionTabIDs()
+	// Diff every tab, not just the session's: a tab a link opens can land
+	// outside the session group (another window, the end of the strip).
+	before := runner.allTabIDs()
 	x, y := target["x"], target["y"]
+	link := runner.linkAt(tabID, x, y)
 	if _, err := cdp("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y}); err != nil {
 		return nil, 0, err
 	}
@@ -2390,8 +2449,13 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 	}
 	for count := 1; count <= clicks; count++ {
 		for _, kind := range []string{"mousePressed", "mouseReleased"} {
+			// buttons is the state after the event: held on press, none on release.
+			buttons := 1
+			if kind == "mouseReleased" {
+				buttons = 0
+			}
 			if _, err := cdp("Input.dispatchMouseEvent", map[string]any{
-				"type": kind, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": count,
+				"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": count,
 			}); err != nil {
 				return nil, 0, err
 			}
@@ -2400,13 +2464,22 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 	// Report tabs the click opened so the caller doesn't have to diff tab lists.
 	time.Sleep(clickSettleDelay)
 	var opened []int
-	for _, id := range runner.sessionTabIDs() {
-		if !slices.Contains(before, id) {
-			opened = append(opened, id)
+	if before != nil {
+		for _, id := range runner.allTabIDs() {
+			if !slices.Contains(before, id) {
+				opened = append(opened, id)
+			}
 		}
 	}
 	if len(opened) > 0 {
 		target["openedTabIds"] = opened
+	}
+	if link != nil {
+		target["link"] = link
+		if linkOpensNewTab(link) && len(opened) == 0 && before != nil {
+			target["newTabMissing"] = true
+			target["warning"] = "the link opens a new tab, but none appeared; Chrome may have blocked it as a popup, or the page cancelled the click. open-tab --url with link.href opens it directly (a one-time sign-in link may need a fresh click instead)"
+		}
 	}
 	if _, ok := target["obscuredBy"]; ok {
 		target["warning"] = "another element covers the target (a dialog, overlay, or preview?); take a screenshot to check"
@@ -2415,6 +2488,85 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 }
 
 const clickSettleDelay = 1200 * time.Millisecond
+
+// linkAtPointScript describes the link (if any) under a viewport point,
+// descending into open shadow roots.
+const linkAtPointScript = `((x, y) => {
+  let el = document.elementFromPoint(x, y);
+  while (el && el.shadowRoot) {
+    const inner = el.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  let node = el;
+  while (node) {
+    if (node.tagName === "A" && node.href) {
+      return { href: node.href, target: node.target || "", rel: node.rel || "" };
+    }
+    const root = node.getRootNode();
+    node = node.parentElement || (root instanceof ShadowRoot ? root.host : null);
+  }
+  return null;
+})`
+
+// linkAt returns the link under (x, y), or nil when there is none or the page
+// cannot be read.
+func (runner *actionRunner) linkAt(tabID int, x, y any) map[string]any {
+	coords, _ := json.Marshal([]any{x, y})
+	response, _, err := runner.invoke("executeCdp", map[string]any{
+		"target": tabTarget(tabID, ""), "method": "Runtime.evaluate",
+		"commandParams": map[string]any{
+			"expression":    linkAtPointScript + "(..." + string(coords) + ")",
+			"returnByValue": true,
+		},
+		"timeoutMs": cdpTimeoutMs(runner.options.timeout),
+	})
+	if err != nil || rpcError(response) != nil {
+		return nil
+	}
+	result, _ := response["result"].(map[string]any)
+	inner, _ := result["result"].(map[string]any)
+	link, _ := inner["value"].(map[string]any)
+	return link
+}
+
+func linkOpensNewTab(link map[string]any) bool {
+	target, _ := link["target"].(string)
+	switch strings.ToLower(target) {
+	case "", "_self", "_parent", "_top":
+		return false
+	}
+	return true
+}
+
+// allTabIDs lists every tab in the profile, or nil if that fails.
+func (runner *actionRunner) allTabIDs() []int {
+	response, _, err := runner.invoke("getUserTabs", map[string]any{})
+	if err != nil || rpcError(response) != nil {
+		return nil
+	}
+	tabs, _ := response["result"].([]any)
+	ids := []int{}
+	for _, raw := range tabs {
+		if tab, ok := raw.(map[string]any); ok {
+			if id, ok := numberAsInt(tab["id"]); ok {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// tabState returns the extension's getTabState result, or nil on an older
+// extension that lacks it.
+func (runner *actionRunner) tabState(tabID int) map[string]any {
+	response, _, err := runner.invoke("getTabState", map[string]any{"tabId": tabID})
+	if err != nil || rpcError(response) != nil {
+		return nil
+	}
+	state, _ := response["result"].(map[string]any)
+	return state
+}
 
 // scrollChainJS returns the elements a wheel at the viewport center could
 // scroll: the page, body, and the composed-tree ancestors of the element
@@ -2556,12 +2708,19 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		}
 		return value, nil
 	}
+	// Put focus emulation back the way it was afterwards, so page-info run
+	// after scroll sees the same state as before it. The extension keeps it
+	// on for tabs the agent opened and off for tabs claimed from the user.
+	priorState := runner.tabState(tabID)
+	restoreOff := runner.tabOrigin(tabID) == "user"
+	if priorState != nil {
+		emulated, _ := priorState["focusEmulated"].(bool)
+		restoreOff = !emulated
+	}
 	if _, err := cdp("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true}); err != nil {
 		return nil, 0, err
 	}
-	// A tab claimed from the user goes back to its real focus state afterwards;
-	// the extension keeps emulation on only for tabs the agent opened.
-	if runner.tabOrigin(tabID) == "user" {
+	if restoreOff {
 		defer cdp("Emulation.setFocusEmulationEnabled", map[string]any{"enabled": false})
 	}
 	before, err := state()
@@ -2721,6 +2880,12 @@ func (runner *actionRunner) runScrollAction(args []string) (map[string]any, int,
 		return out
 	}
 	result := map[string]any{"steps": steps, "stopped": stopped, "input": input, "before": summary(before), "after": summary(after)}
+	// visibilityState above is what the page saw with focus emulation on.
+	result["focusEmulated"] = true
+	result["focusEmulationRestored"] = map[bool]string{true: "off", false: "on"}[restoreOff]
+	if priorState != nil {
+		result["tab"] = tabStateSummary(priorState)
+	}
 	if blind {
 		result["warning"] = "the center of the tab is an iframe, plugin, or closed shadow root that scroll cannot measure, so it ran without detecting the end; check the result with page-info or a screenshot, or scroll inside the frame with cdp"
 	}
@@ -2749,25 +2914,20 @@ func (runner *actionRunner) tabOrigin(tabID int) string {
 	return ""
 }
 
-func (runner *actionRunner) sessionTabIDs() []int {
-	response, _, err := runner.invoke("getTabs", map[string]any{})
-	if err != nil {
-		return nil
-	}
-	tabs, _ := response["result"].([]any)
-	var ids []int
-	for _, raw := range tabs {
-		if tab, ok := raw.(map[string]any); ok {
-			if id, ok := numberAsInt(tab["id"]); ok {
-				ids = append(ids, id)
-			}
-		}
-	}
-	return ids
-}
-
 func hasArg(args []string, name string) bool {
 	return slices.Contains(args, name)
+}
+
+// withoutArgs drops boolean flags so positionalArgs does not take the next
+// argument as their value.
+func withoutArgs(args []string, names ...string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		if !slices.Contains(names, arg) {
+			out = append(out, arg)
+		}
+	}
+	return out
 }
 
 func (runner *actionRunner) runFramesAction(args []string) (map[string]any, int, error) {
@@ -2794,7 +2954,11 @@ func (runner *actionRunner) runPageInfoAction(args []string) (map[string]any, in
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := runner.attach(tabID); err != nil {
+	fallbackMethod := "Runtime.evaluate"
+	if stringFlag(args, "--frame") != "" {
+		fallbackMethod = ""
+	}
+	if err := runner.attachFor(tabID, fallbackMethod); err != nil {
 		return nil, 0, err
 	}
 	response, _, err := runner.invoke("executeCdp", map[string]any{
@@ -2805,7 +2969,37 @@ func (runner *actionRunner) runPageInfoAction(args []string) (map[string]any, in
 			"returnByValue": true,
 		},
 	})
+	if err != nil {
+		return response, tabID, err
+	}
+	// visibilityState is what the page sees, which focus emulation can change.
+	// Add the tab's real state so the field means the same thing everywhere.
+	if value := cdpResultValue(response); value != nil {
+		if state := runner.tabState(tabID); state != nil {
+			value["focusEmulated"] = state["focusEmulated"]
+			value["tab"] = tabStateSummary(state)
+		}
+	}
 	return response, tabID, err
+}
+
+// cdpResultValue returns the returnByValue object of a Runtime.evaluate
+// response, for annotating in place.
+func cdpResultValue(response map[string]any) map[string]any {
+	result, _ := response["result"].(map[string]any)
+	inner, _ := result["result"].(map[string]any)
+	value, _ := inner["value"].(map[string]any)
+	return value
+}
+
+func tabStateSummary(state map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, key := range []string{"active", "windowFocused", "windowState", "visibleToUser"} {
+		if value, ok := state[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func (runner *actionRunner) runCDPAction(args []string) (map[string]any, int, error) {
@@ -2829,7 +3023,11 @@ func (runner *actionRunner) runCDPAction(args []string) (map[string]any, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := runner.attach(tabID); err != nil {
+	fallbackMethod := method
+	if stringFlag(args, "--frame") != "" {
+		fallbackMethod = ""
+	}
+	if err := runner.attachFor(tabID, fallbackMethod); err != nil {
 		return nil, 0, err
 	}
 	execute := func() (map[string]any, int, error) {
@@ -3238,9 +3436,30 @@ func invokeWithProfile(socketPath string, socketDir string, browser string, prof
 	response, err := readResponseForID(conn, requestID)
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return nil, fmt.Errorf("no reply from the browser to %s within %s; the page or browser may be busy (first call after the browser wakes can be slow). Retry, or pass a longer --timeout such as 30s", method, timeout)
+		return nil, fmt.Errorf("no reply from the browser to %s within %s; the page or browser may be busy (first call after the browser wakes can be slow). %s", method, timeout, timeoutRetryHint(method, params))
 	}
 	return response, err
+}
+
+// timeoutRetryHint warns that a timed-out command that changes the page may
+// already have run, so a blind retry can apply it twice.
+func timeoutRetryHint(method string, params map[string]any) string {
+	cdpMethod, _ := params["method"].(string)
+	if method == "executeCdp" && cdpMethodHasSideEffects(cdpMethod) {
+		return fmt.Sprintf("The %s command may already have run; check the page (page-info, a screenshot) before retrying, or the action can happen twice.", cdpMethod)
+	}
+	return "Retry, or pass a longer --timeout such as 30s."
+}
+
+func cdpMethodHasSideEffects(method string) bool {
+	switch {
+	case strings.HasPrefix(method, "Input."),
+		method == "Page.navigate", method == "Page.reload",
+		method == "Runtime.evaluate", method == "Runtime.callFunctionOn",
+		method == "DOM.setFileInputFiles", method == "Page.handleJavaScriptDialog":
+		return true
+	}
+	return false
 }
 
 func readResponseForID(conn net.Conn, requestID string) (map[string]any, error) {
@@ -3292,11 +3511,37 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 		}
 		return conn, nil
 	}
-	conn, _, _, err := pickSocketForProfile(socketDir, browser, profile, timeout)
-	if err != nil {
-		return nil, err
+	// The host goes away while Chrome restarts the extension's service worker
+	// and comes back a few seconds later; a busy extension can also miss the
+	// short getInfo probe. Nothing has been sent yet, so retrying is safe.
+	deadline := time.Now().Add(hostDiscoveryBudget(timeout))
+	probe := 800 * time.Millisecond
+	for {
+		conn, _, _, err := pickSocketForProfileProbe(socketDir, browser, profile, timeout, probe)
+		if err == nil {
+			return conn, nil
+		}
+		if time.Now().Add(hostRetryDelay).After(deadline) {
+			return nil, fmt.Errorf("%w (kept retrying for %s; the extension may be restarting, so retry in a few seconds or pass a longer --timeout)", err, hostDiscoveryBudget(timeout).Round(time.Second))
+		}
+		time.Sleep(hostRetryDelay)
+		if probe < 2*time.Second {
+			probe *= 2
+		}
 	}
-	return conn, nil
+}
+
+const hostRetryDelay = 500 * time.Millisecond
+
+// hostDiscoveryBudget is how long to keep looking for a matching host before
+// giving up: most of the command timeout, capped so a long --timeout meant
+// for a slow page does not also mean a long wait for a closed browser.
+func hostDiscoveryBudget(timeout time.Duration) time.Duration {
+	budget := timeout * 8 / 10
+	if budget > 20*time.Second {
+		budget = 20 * time.Second
+	}
+	return budget
 }
 
 func dialBrowserSocket(socketPath string, socketDir string, timeout time.Duration) (net.Conn, error) {
@@ -3459,6 +3704,10 @@ func verifySocketMatchesProfile(conn net.Conn, browserSelector string, profileSe
 }
 
 func pickSocketForProfile(socketDir string, browserSelector string, profileSelector string, timeout time.Duration) (net.Conn, connectedProfileInfo, []connectedProfileInfo, error) {
+	return pickSocketForProfileProbe(socketDir, browserSelector, profileSelector, timeout, 800*time.Millisecond)
+}
+
+func pickSocketForProfileProbe(socketDir string, browserSelector string, profileSelector string, timeout time.Duration, maxProbe time.Duration) (net.Conn, connectedProfileInfo, []connectedProfileInfo, error) {
 	candidates, err := listSocketCandidates(socketDir)
 	if err != nil {
 		return nil, connectedProfileInfo{}, nil, err
@@ -3467,10 +3716,11 @@ func pickSocketForProfile(socketDir string, browserSelector string, profileSelec
 		return nil, connectedProfileInfo{}, nil, fmt.Errorf("no Open Browser Use socket found; open Chrome with the desired profile (`open-browser-use profiles` lists installed profiles)")
 	}
 	probeTimeout := timeout
-	if probeTimeout > 800*time.Millisecond {
-		probeTimeout = 800 * time.Millisecond
+	if probeTimeout > maxProbe {
+		probeTimeout = maxProbe
 	}
 	var seen []connectedProfileInfo
+	busy := 0
 	for _, candidate := range candidates {
 		conn, err := net.DialTimeout("unix", candidate.path, probeTimeout)
 		if err != nil {
@@ -3479,6 +3729,7 @@ func pickSocketForProfile(socketDir string, browserSelector string, profileSelec
 		}
 		resp, err := getInfoOverConn(conn, probeTimeout)
 		if err != nil {
+			busy++
 			_ = conn.Close()
 			continue
 		}
@@ -3490,7 +3741,11 @@ func pickSocketForProfile(socketDir string, browserSelector string, profileSelec
 		}
 		_ = conn.Close()
 	}
-	return nil, connectedProfileInfo{}, seen, fmt.Errorf("no running Open Browser Use host matched --browser %q --profile %q; %s", browserSelector, profileSelector, profileMatchHint(seen))
+	hint := profileMatchHint(seen)
+	if busy > 0 {
+		hint += fmt.Sprintf("; %d host(s) accepted the connection but did not answer within %s (busy or restarting)", busy, probeTimeout)
+	}
+	return nil, connectedProfileInfo{}, seen, fmt.Errorf("no running Open Browser Use host matched --browser %q --profile %q; %s", browserSelector, profileSelector, hint)
 }
 
 func profileMatchHint(seen []connectedProfileInfo) string {

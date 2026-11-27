@@ -116,8 +116,29 @@ open-browser-use history --session-id "$OBU_SESSION_ID" --query "example" --limi
 open-browser-use open-tab --session-id "$OBU_SESSION_ID" --url https://example.com
 open-browser-use navigate --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --url https://example.com
 open-browser-use cdp --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --method Runtime.evaluate --params '{"expression":"document.title"}'
+open-browser-use cdp --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --method Accessibility.getFullAXTree --out /tmp/ax.json
+open-browser-use screenshot --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --out /tmp/page.png
+open-browser-use key --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --keys "ctrl+a Backspace"
+open-browser-use paste --session-id "$OBU_SESSION_ID" --tab-id <tab-id> --text "Hello" --selector "textarea"
 open-browser-use finalize-tabs --session-id "$OBU_SESSION_ID" --keep '[]'
 ```
+
+- `cdp --out FILE` writes the full response to a file and prints only its size,
+  which keeps large results (accessibility trees, DOM snapshots) out of the
+  agent's context.
+- `screenshot` writes a PNG or JPEG (`--format jpeg --quality 80`) instead of
+  printing base64.
+- `key --keys` takes space-separated chords: named keys (`Enter`, `Tab`,
+  `Escape`, `Home`, `End`, arrows, `F1`–`F12`), letters, digits, and the
+  modifiers `ctrl`, `alt`, `shift`, `meta`. `ctrl++` means the plus key.
+- `paste` fires a real `paste` event with the text on the selector (or the
+  focused element, through same-origin frames and open shadow roots). Editors
+  that handle paste themselves, such as Google Docs or Slack, get it that way;
+  otherwise the text goes in with `Input.insertText`. The result's `method`
+  says which happened.
+- `click` reports `openedTabIds` and the `link` under the point. When the link
+  targets a new tab but none opened, it sets `newTabMissing: true`; the page
+  most likely blocked the popup, so open the link's `href` with `open-tab`.
 
 For CLI-level orchestration without writing SDK code, use a line-oriented
 action plan:
@@ -151,7 +172,8 @@ args = ["mcp", "--session-id", "obu-<task-or-conversation-id>"]
 Use a fresh `--session-id` value per agent task or conversation. If the runtime
 has a stable conversation/session id, derive the MCP `--session-id` from it.
 
-The MCP server exposes tools including `user_tabs`, `open_tab`, `claim_tab`,
+The MCP server exposes tools including `user_tabs`, `open_tab` (with optional
+`new_window`), `claim_tab` (with optional `force`),
 `navigate`, `wait_load`, `page_info`, `cdp`, `history`, `run_action_plan`,
 `finalize_tabs`, and unrestricted `call`.
 
@@ -171,6 +193,61 @@ each individual browser operation.
 - Keep a tab with `status: "handoff"` only when the task is still in progress and the user or a later turn should continue from the current task group, such as a page waiting for user input, login, approval, payment, CAPTCHA, or an unfinished workflow.
 - Handoff tabs stay in the task session group. Deliverable tabs move to the shared `✅ Open Browser Use` tab group.
 - Run finalization as the last Open Browser Use browser action for the turn. Do not call Open Browser Use browser tools after finalizing; if more browser work is needed, do it first and finalize once with the final tab disposition.
+
+## Working Next To The User
+
+The user keeps using the same browser while the agent works, so:
+
+- Agent tabs normally open in the user's current window, in the session's tab
+  group. To keep them out of the way, pass `open-tab --new-window` (MCP
+  `open_tab` with `new_window: true`) on the session's **first** tab. The
+  session then keeps its tabs in a separate unfocused window. Once the session
+  has a tab group in the user's window, `--new-window` fails.
+- Chrome does not paint background tabs. `screenshot` and other capture calls
+  briefly bring the agent tab to the front of its window and then switch back,
+  so in a shared window the user sees a short flash. A separate window avoids
+  that. A minimized window cannot be captured at all; the command fails with a
+  message saying so.
+- `page-info` includes `tab.active`, `tab.windowFocused`, `tab.windowState`,
+  `tab.visibleToUser`, and `focusEmulated`. Agent tabs run with focus
+  emulation, so `document.hasFocus()` is true there, but
+  `document.visibilityState` can still read `hidden` in a background tab. Use
+  `tab.visibleToUser` to tell whether the user can see the page.
+- `scroll` turns focus emulation on for its wheel events and restores the
+  previous state afterwards (`focusEmulationRestored`).
+
+### Taking over tabs
+
+- `user-tabs` shows `sessionId` on tabs that belong to a browser session.
+- `claim-tab` refuses a tab that another session owns. If that session was
+  interrupted, take the tab over with `claim-tab --tab-id <id> --force` (MCP
+  `claim_tab` with `force: true`), or keep working in it by passing the owning
+  `--session-id`.
+- When a tab is closed or Chrome replaces it (prerender, discard), commands
+  that name the old id fail with what happened, such as "Chrome replaced it
+  with tab N", instead of a bare "not in session" error.
+
+### Pages with other extensions' frames
+
+Some extensions (password managers, grammar checkers) inject
+`chrome-extension://` iframes into pages, and Chrome then refuses to attach the
+debugger. Open Browser Use retries a few times and then fails with the frame it
+found. In that case `Runtime.evaluate`, `Page.navigate`, `Page.reload`, and
+`Page.captureScreenshot` (active tab only) still work without the debugger;
+their results carry `fallback: "no-debugger"`. Input events and other CDP
+methods need the debugger, so ask the user to disable that extension for the
+site.
+
+### Google Docs and similar editors
+
+- Some shortcuts belong to the browser and never reach the page: `ctrl+f`
+  opens the browser's find bar. In Google Docs, open Find and replace with
+  `ctrl+h` instead.
+- Text fields inside Docs dialogs react to `input` events, not to a bare value
+  change. Set the value with `cdp Runtime.evaluate` and dispatch
+  `new Event('input', {bubbles: true})`, or focus the field and use `paste`.
+- To fill a placeholder in the document, select it (for example with Find and
+  replace or a double click) and then `paste` the replacement.
 
 ## File Choosers, Downloads, And Clipboard
 

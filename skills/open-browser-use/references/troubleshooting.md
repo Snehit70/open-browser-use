@@ -43,6 +43,50 @@ open-browser-use ping --timeout 20s
 
 If no active host exists, opening Chrome with the extension enabled can allow Chrome to start the native host.
 
+## "No Chrome host was reachable" In The Middle Of A Task
+
+Chrome stops an idle MV3 service worker, and the native host restarts with it.
+For a moment no host answers. The CLI keeps retrying discovery for up to 80% of
+`--timeout` (at most 20 seconds) before it gives up, and the error then says how
+long it retried. If it still fails, wait a few seconds and run `ping` again. If
+the error says a host "accepted the connection but did not answer", the
+extension is busy or restarting; retrying usually works.
+
+## Timeouts On Input Commands
+
+A timeout means the CLI stopped waiting, not that Chrome skipped the command.
+For clicks, key presses, typing, navigation, `Runtime.evaluate`, and other
+commands with side effects, the error says the command may already have run.
+Check the page (`page-info`, a screenshot) before retrying, or the action can
+happen twice.
+
+## Debugger Cannot Attach: Another Extension's Frame
+
+The error "Cannot access a chrome-extension:// URL of different extension"
+means another extension injected a frame into the page. Open Browser Use
+retries three times over about five seconds, then names the frame it found.
+For five seconds after that it fails fast instead of retrying again.
+
+- `Runtime.evaluate`, `Page.navigate`, `Page.reload`, and
+  `Page.captureScreenshot` (active tab only) fall back to running without the
+  debugger and return `fallback: "no-debugger"`.
+- Input events, `--frame` calls, and other CDP methods need the debugger. Ask
+  the user to disable the named extension for this site, or reload the page
+  after the frame goes away.
+- If the tab itself shows another extension's page, nothing can attach;
+  navigate it to a normal page or use another tab.
+
+## Tab Errors
+
+- "belongs to session S": another browser session owns the tab. Use
+  `claim-tab --tab-id <id> --force` if that session was interrupted.
+- "Chrome replaced it with tab N": use the new id from the message.
+- "the tab no longer exists": the tab was closed. List tabs and open or claim
+  another one.
+- "...must come before the session's first tab": `open-tab --new-window` only
+  works before the session has a tab group in the user's window. Start a new
+  session id to get a separate window.
+
 ## Extension Or Native Host Mismatch
 
 The native host manifest must allow the installed extension id. The default Web Store id is built into the CLI, while `setup beta` uses the keyed GitHub Release ZIP, registers that stable id, and reveals that same ZIP for manual installation.
