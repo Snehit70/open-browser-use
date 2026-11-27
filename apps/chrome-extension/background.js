@@ -10,6 +10,7 @@ const DEFAULT_WEBMCP_LIST_TIMEOUT_MS = 5_000;
 const WEBMCP_TIMEOUT_GRACE_MS = 1_500;
 const CURSOR_ARRIVAL_TIMEOUT_MS = 1_000;
 const MAX_USER_TABS = 1000;
+const MAX_LOST_TABS = 200;
 const DEFAULT_SESSION_GROUP_TITLE = "Task - OBU";
 const DELIVERABLE_GROUP_TITLE = "✅ Open Browser Use";
 const LEGACY_SESSION_GROUP_TITLE_PATTERN = /^Open Browser Use [0-9a-f]{8}$/i;
@@ -319,13 +320,31 @@ class BrowserBackend {
     this.framesByTabId = new Map();
     this.pendingSpawns = new Map();
     this.attachSetups = new Map();
+    // Tabs where this extension turned Emulation.setFocusEmulationEnabled on,
+    // so page-info and scroll can say what the page's visibilityState means.
+    this.focusEmulatedTabs = new Set();
+    // tabId -> { reason, sessionId, at, replacedBy? } for session tabs that
+    // were closed or replaced, so a later "not part of session" error can say
+    // what happened instead of leaving the agent guessing.
+    this.lostTabs = new Map();
+    // tabId -> { at, frames } for tabs whose debugger attach was refused
+    // because another extension's frame is in the page.
+    this.foreignAttachFailures = new Map();
     this.nextCursorMoveSequence = 1;
     chrome.debugger.onDetach.addListener((source) => {
       if (typeof source.tabId === "number") {
         this.attachedTabs.delete(source.tabId);
         this.dialogsByTabId.delete(source.tabId);
         this.framesByTabId.delete(source.tabId);
+        this.focusEmulatedTabs.delete(source.tabId);
       }
+    });
+    chrome.tabs?.onRemoved?.addListener((tabId) => {
+      this.forgetTab(tabId, { reason: "closed" }).catch(() => {});
+    });
+    // Prerendering and some redirects swap the tab for a new one with a new id.
+    chrome.tabs?.onReplaced?.addListener((addedTabId, removedTabId) => {
+      this.replaceTab(addedTabId, removedTabId).catch(() => {});
     });
     // Links with target=_blank and window.open() in a session tab land in the
     // session group with no recorded origin, so finalize would only ungroup
@@ -356,6 +375,60 @@ class BrowserBackend {
     }
     owner.session.tabOrigins[String(tab.id)] ??= "agent";
     await this.store.save();
+    // Chrome only puts a spawned tab in the opener's group when it opens next
+    // to it. A tab opened at the end of the strip or in another window stays
+    // ungrouped, and the session would never see it. Pull it in.
+    if (tab.groupId !== opener.groupId) {
+      await chrome.tabs.group({ groupId: opener.groupId, tabIds: [tab.id] }).catch(() => {});
+    }
+  }
+
+  // A session tab closed: drop it from its session and remember why, for
+  // requireSessionTab's error.
+  async forgetTab(tabId, { reason, replacedBy } = {}) {
+    await this.store.ready;
+    this.attachedTabs.delete(tabId);
+    this.focusEmulatedTabs.delete(tabId);
+    this.foreignAttachFailures.delete(tabId);
+    for (const [sessionId, session] of Object.entries(this.store.state.sessions ?? {})) {
+      const key = String(tabId);
+      if (!session.tabOrigins || !(key in session.tabOrigins)) continue;
+      this.rememberLostTab(tabId, { reason, sessionId, replacedBy });
+      if (replacedBy === undefined) {
+        delete session.tabOrigins[key];
+        await this.store.save();
+      }
+    }
+  }
+
+  rememberLostTab(tabId, entry) {
+    this.lostTabs.set(tabId, { ...entry, at: Date.now() });
+    while (this.lostTabs.size > MAX_LOST_TABS) {
+      this.lostTabs.delete(this.lostTabs.keys().next().value);
+    }
+  }
+
+  // Keep a replaced tab in its session under the new id.
+  async replaceTab(addedTabId, removedTabId) {
+    await this.store.ready;
+    const removedKey = String(removedTabId);
+    for (const [sessionId, session] of Object.entries(this.store.state.sessions ?? {})) {
+      const origin = session.tabOrigins?.[removedKey];
+      if (!origin) continue;
+      delete session.tabOrigins[removedKey];
+      session.tabOrigins[String(addedTabId)] = origin;
+      if (session.activeTabId === removedTabId) session.activeTabId = addedTabId;
+      if (this.activeTabsBySession.get(sessionId) === removedTabId) {
+        this.activeTabsBySession.set(sessionId, addedTabId);
+      }
+      this.rememberLostTab(removedTabId, { reason: "replaced", sessionId, replacedBy: addedTabId });
+      await this.store.save();
+      if (typeof session.chromeGroupId === "number") {
+        await chrome.tabs.group({ groupId: session.chromeGroupId, tabIds: [addedTabId] }).catch(() => {});
+      }
+    }
+    this.attachedTabs.delete(removedTabId);
+    this.focusEmulatedTabs.delete(removedTabId);
   }
 
   ping() {
@@ -386,10 +459,45 @@ class BrowserBackend {
 
   async createTab(params) {
     const session = await this.requireSession(params);
-    const chromeTab = await createBackgroundTab();
+    const sessionState = await this.store.getSession(session.sessionId);
+    // newWindow keeps the session's tabs in their own unfocused window, so
+    // screenshots (which must make the tab active to paint it) never swap out
+    // the tab the user is looking at. Later tabs in the session follow it.
+    const wantsWindow = params.newWindow === true || typeof sessionState.agentWindowId === "number";
+    const chromeTab = wantsWindow
+      ? await this.createAgentWindowTab(sessionState)
+      : await createBackgroundTab();
     await this.ensureSessionGroup(session.sessionId, chromeTab.id, "agent");
     await this.setSessionActiveTab(session.sessionId, chromeTab.id);
     return { ...toBrowserTab(chromeTab), active: true };
+  }
+
+  async createAgentWindowTab(sessionState) {
+    if (typeof sessionState.agentWindowId === "number") {
+      const win = await chrome.windows.get(sessionState.agentWindowId).catch(() => null);
+      if (win) {
+        const tab = await chrome.tabs.create({ active: true, url: "about:blank", windowId: win.id }).catch(() => null);
+        if (hasTabId(tab)) return tab;
+      }
+    } else if (typeof sessionState.chromeGroupId === "number") {
+      // Groups cannot span windows, and adding a tab to the session's group
+      // would pull it back into the user's window.
+      const group = await chrome.tabGroups.get(sessionState.chromeGroupId).catch(() => null);
+      if (group) {
+        throw new Error(
+          "open-tab --new-window must come before the session's first tab; this session already has tabs in another window. Use a new --session-id."
+        );
+      }
+    }
+    const win = await chrome.windows.create({ focused: false, type: "normal", url: "about:blank" });
+    const tab = win.tabs?.find(hasTabId);
+    if (!tab) {
+      throw new Error("Created Chrome window has no tab");
+    }
+    sessionState.agentWindowId = win.id;
+    sessionState.chromeGroupId = null;
+    await this.store.save();
+    return tab;
   }
 
   async getTabs(params) {
@@ -409,7 +517,17 @@ class BrowserBackend {
       .sort(compareLastAccessed)
       .slice(0, MAX_USER_TABS);
     const groupTitles = await readGroupTitles(tabs);
-    return tabs.map((tab) => toUserTab(tab, groupTitles));
+    // Name the session that owns a grouped tab, so an agent whose earlier
+    // session was interrupted can see which tab is still claimed and by whom.
+    const groupSessions = new Map();
+    for (const [sessionId, session] of Object.entries(this.store.state.sessions ?? {})) {
+      if (typeof session.chromeGroupId === "number") groupSessions.set(session.chromeGroupId, sessionId);
+    }
+    return tabs.map((tab) => {
+      const userTab = toUserTab(tab, groupTitles);
+      const owner = groupSessions.get(tab.groupId);
+      return owner ? { ...userTab, sessionId: owner } : userTab;
+    });
   }
 
   /**
@@ -480,16 +598,38 @@ class BrowserBackend {
         `Tab ${tabId} shows ${tab.url}; Chrome does not let extensions control chrome:// pages. Open the page in a new tab with open-tab --url if it has a web equivalent.`
       );
     }
+    let origin = "user";
     if (typeof tab.groupId === "number" && tab.groupId !== -1) {
       const owner = await this.store.findSessionByGroup(tab.groupId);
       if (owner && owner.sessionId !== session.sessionId) {
-        throw new Error(`Tab ${tabId} is already part of browser session ${owner.sessionId}`);
+        if (params.force !== true) {
+          throw new Error(
+            `Tab ${tabId} is already part of browser session ${owner.sessionId}. ` +
+              `If that session was interrupted, take the tab over with: obu claim-tab --tab-id ${tabId} --force, ` +
+              `or keep working in it with --session-id ${owner.sessionId}.`
+          );
+        }
+        // Take over: keep the origin so finalize still closes a tab the agent
+        // opened and only ungroups one the user opened.
+        const key = String(tab.id);
+        origin = owner.session.tabOrigins?.[key] ?? "user";
+        delete owner.session.tabOrigins?.[key];
+        if (owner.session.activeTabId === tab.id) owner.session.activeTabId = null;
+        if (this.activeTabsBySession.get(owner.sessionId) === tab.id) {
+          this.activeTabsBySession.delete(owner.sessionId);
+        }
+        await this.store.save();
+        await chrome.tabs.ungroup(tab.id).catch(() => {});
+      } else if (owner) {
+        origin = owner.session.tabOrigins?.[String(tab.id)] ?? "user";
       }
     }
     // Forget any earlier attachment record so the next command re-attaches
     // against the tab's current state instead of trusting a stale entry.
     this.attachedTabs.delete(tab.id);
-    await this.ensureSessionGroup(session.sessionId, tab.id, "user");
+    this.focusEmulatedTabs.delete(tab.id);
+    this.lostTabs.delete(tab.id);
+    await this.ensureSessionGroup(session.sessionId, tab.id, origin);
     await this.setSessionActiveTab(session.sessionId, tab.id);
     return { ...toBrowserTab(tab), active: true };
   }
@@ -608,16 +748,7 @@ class BrowserBackend {
       await this.attachSetups.get(tabId);
       return;
     }
-    try {
-      await chrome.debugger.attach({ tabId }, "1.3");
-    } catch (error) {
-      // Our own attachment can outlive a service worker restart; Chrome then
-      // reports it as "Another debugger". A real foreign debugger surfaces on
-      // the next sendCommand instead.
-      if (!String(error?.message ?? error).includes("Another debugger")) {
-        throw error;
-      }
-    }
+    await this.attachDebugger(tabId);
     this.attachedTabs.add(tabId);
     const setup = this.setUpAttachedTab(tabId);
     this.attachSetups.set(tabId, setup);
@@ -626,6 +757,85 @@ class BrowserBackend {
     } finally {
       if (this.attachSetups.get(tabId) === setup) this.attachSetups.delete(tabId);
     }
+  }
+
+  async attachDebugger(tabId) {
+    // A frame from another extension (a password manager, an OAuth helper)
+    // makes Chrome refuse the attach. Such frames are usually short-lived, so
+    // retry with backoff, but only once per few seconds per tab: if the last
+    // attempt just failed, fail fast instead of stalling every command.
+    const recent = this.foreignAttachFailures.get(tabId);
+    const delays = recent && Date.now() - recent.at < FOREIGN_ATTACH_COOLDOWN_MS ? [] : FOREIGN_ATTACH_RETRY_DELAYS_MS;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await chrome.debugger.attach({ tabId }, "1.3");
+        this.foreignAttachFailures.delete(tabId);
+        return;
+      } catch (error) {
+        const message = String(error?.message ?? error);
+        // Our own attachment can outlive a service worker restart; Chrome then
+        // reports it as "Another debugger". A real foreign debugger surfaces on
+        // the next sendCommand instead.
+        if (message.includes("Another debugger")) {
+          this.foreignAttachFailures.delete(tabId);
+          return;
+        }
+        if (!isForeignExtensionFrameError(error)) {
+          throw error;
+        }
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        const tabUrl = tab?.url || tab?.pendingUrl || "";
+        if (tabUrl.startsWith("chrome-extension://")) {
+          // The tab itself navigated to another extension's page; waiting
+          // will not help.
+          throw new Error(
+            `${message} (tab ${tabId}). The tab now shows another extension's page (${tabUrl.split("/").slice(0, 3).join("/")}), which no other extension may debug. Navigate it back with obu navigate, or use another tab.`
+          );
+        }
+        if (attempt >= delays.length) {
+          const frames = await findExtensionFrames(tabId);
+          this.foreignAttachFailures.set(tabId, { at: Date.now(), frames });
+          throw new Error(foreignFrameMessage(tabId, message, frames));
+        }
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
+  }
+
+  // Turn focus emulation on or off and remember it, so commands can report
+  // what the page's visibilityState and hasFocus() mean.
+  async setFocusEmulation(tabId, enabled) {
+    await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled });
+    if (enabled) {
+      this.focusEmulatedTabs.add(tabId);
+    } else {
+      this.focusEmulatedTabs.delete(tabId);
+    }
+  }
+
+  // The tab's real state, independent of what the page sees. Focus emulation
+  // only changes what the page reports (and not always: Chromium forks differ),
+  // so agents should read active/windowFocused to know whether the user can
+  // see the tab.
+  async getTabState(params) {
+    await this.requireSessionTab(params, "getTabState");
+    const tabId = requireTabId(params, "getTabState");
+    const tab = await chrome.tabs.get(tabId);
+    const win = typeof tab.windowId === "number" ? await chrome.windows.get(tab.windowId).catch(() => null) : null;
+    return {
+      tabId,
+      active: tab.active === true,
+      windowId: tab.windowId ?? null,
+      windowFocused: win?.focused === true,
+      windowState: win?.state ?? null,
+      visibleToUser: tab.active === true && win?.state !== "minimized",
+      focusEmulated: this.focusEmulatedTabs.has(tabId),
+      agentTab: this.isAgentTab(tabId),
+      debuggerAttached: this.attachedTabs.has(tabId),
+      ...(this.foreignAttachFailures.has(tabId)
+        ? { attachBlockedBy: this.foreignAttachFailures.get(tabId).frames }
+        : {})
+    };
   }
 
   async setUpAttachedTab(tabId) {
@@ -639,7 +849,9 @@ class BrowserBackend {
     // Only for tabs the agent opened: on a tab claimed from the user it would
     // also mark chats read or keep media playing while the user is elsewhere.
     if (this.isAgentTab(tabId)) {
-      await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+      await this.setFocusEmulation(tabId, true).catch(() => {});
+    } else {
+      this.focusEmulatedTabs.delete(tabId);
     }
     await this.enableFrameAttach({ tabId });
   }
@@ -739,14 +951,25 @@ class BrowserBackend {
     await this.requireSession(params);
     const rawTarget = params.target && typeof params.target === "object" ? params.target : {};
     const tabId = rawTarget.tabId;
-    if (typeof tabId === "number") {
-      await this.requireSessionTab({ ...params, tabId }, "executeCdp");
-      await this.ensureAttached(tabId);
-    }
     const timeoutMs =
       typeof params.timeoutMs === "number" && params.timeoutMs > 0
         ? params.timeoutMs
         : DEFAULT_CDP_TIMEOUT_MS;
+    if (typeof tabId === "number") {
+      await this.requireSessionTab({ ...params, tabId }, "executeCdp");
+      try {
+        await this.ensureAttached(tabId);
+      } catch (error) {
+        // Another extension's frame blocks the debugger. A few commands have
+        // debugger-free equivalents; run those so the agent is not blind.
+        if (isForeignExtensionFrameError(error) && DEBUGGER_FREE_METHODS.has(params.method) && !rawTarget.frame) {
+          return await withTimeout(timeoutMs, () =>
+            this.executeWithoutDebugger(tabId, params.method, params.commandParams ?? {}, error)
+          );
+        }
+        throw error;
+      }
+    }
     if (typeof tabId === "number" && params.method !== "Page.handleJavaScriptDialog") {
       const dialog = this.dialogsByTabId.get(tabId);
       if (dialog) {
@@ -777,6 +1000,10 @@ class BrowserBackend {
         throw new Error("executeCdp requires method");
       }
       const commandParams = params.commandParams ?? {};
+      if (params.method === "Emulation.setFocusEmulationEnabled" && typeof tabId === "number" && !target.sessionId) {
+        await this.setFocusEmulation(tabId, commandParams.enabled === true);
+        return {};
+      }
       try {
         return await chrome.debugger.sendCommand(target, params.method, commandParams);
       } catch (error) {
@@ -814,11 +1041,79 @@ class BrowserBackend {
     }
   }
 
+  // Run a command through chrome.scripting / chrome.tabs instead of the
+  // debugger. Results keep the CDP shape and carry a fallback marker.
+  async executeWithoutDebugger(tabId, method, commandParams, attachError) {
+    const fallback = { fallback: "no-debugger", reason: String(attachError?.message ?? attachError) };
+    switch (method) {
+      case "Runtime.evaluate": {
+        if (typeof commandParams.expression !== "string") {
+          throw new Error("Runtime.evaluate requires expression");
+        }
+        let injection;
+        try {
+          [injection] = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            args: [commandParams.expression],
+            // Indirect eval runs in global scope like Runtime.evaluate. A page
+            // CSP without 'unsafe-eval' blocks it; that error is returned.
+            func: (expression) => (0, eval)(expression)
+          });
+        } catch (error) {
+          throw new Error(`${fallback.reason} The scripting fallback failed too: ${String(error?.message ?? error)}`);
+        }
+        const value = injection?.result;
+        return {
+          result: value === undefined ? { type: "undefined" } : { type: value === null ? "object" : typeof value, value },
+          ...fallback
+        };
+      }
+      case "Page.navigate": {
+        if (typeof commandParams.url !== "string") {
+          throw new Error("Page.navigate requires url");
+        }
+        await chrome.tabs.update(tabId, { url: commandParams.url });
+        return { frameId: "", ...fallback };
+      }
+      case "Page.reload":
+        await chrome.tabs.reload(tabId, { bypassCache: commandParams.ignoreCache === true });
+        return { ...fallback };
+      case "Page.captureScreenshot": {
+        const tab = await chrome.tabs.get(tabId);
+        if (!tab.active) {
+          throw new Error(
+            `${fallback.reason} The screenshot fallback (captureVisibleTab) only works on the active tab of its window, and tab ${tabId} is in the background.`
+          );
+        }
+        const format = commandParams.format === "jpeg" ? "jpeg" : "png";
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format,
+          ...(format === "jpeg" && typeof commandParams.quality === "number" ? { quality: commandParams.quality } : {})
+        });
+        return { data: dataUrl.slice(dataUrl.indexOf(",") + 1), ...fallback };
+      }
+      default:
+        throw attachError;
+    }
+  }
+
   // Chromium stops painting hidden tabs, so Page.captureScreenshot on a
   // background tab hangs or returns a blank frame. Switch to the tab within its
-  // window for the capture and switch back; the window is not focused.
+  // window for the capture and switch back; the window is not focused. When
+  // that window is the one the user is in, the swap shows for a moment, so
+  // agents that screenshot often should use open-tab --new-window.
   async withTabVisible(tabId, fn) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && typeof tab.windowId === "number") {
+      const win = await chrome.windows.get(tab.windowId).catch(() => null);
+      if (win?.state === "minimized") {
+        throw new Error(
+          `Tab ${tabId} is in a minimized window, and Chrome does not paint minimized windows, so the screenshot would hang. ` +
+            "Restore the window, or read the page with page-info / Runtime.evaluate instead."
+        );
+      }
+    }
     if (!tab || tab.active || typeof tab.windowId !== "number") {
       return await fn();
     }
@@ -1472,7 +1767,14 @@ class BrowserBackend {
       }
     }
     if (typeof groupId !== "number") {
-      groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      // Without a windowId Chrome may create the group in the last focused
+      // window and move the tab there.
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      groupId = await chrome.tabs.group(
+        typeof tab?.windowId === "number"
+          ? { tabIds: [tabId], createProperties: { windowId: tab.windowId } }
+          : { tabIds: [tabId] }
+      );
       session.chromeGroupId = groupId;
     }
     session.tabOrigins[String(tabId)] = origin;
@@ -1528,13 +1830,37 @@ class BrowserBackend {
     const tabs = await this.getSessionTabs(session.sessionId, { includeInternal: true });
     const tab = tabs.find((candidate) => candidate.id === tabId);
     if (!tab) {
-      throw new Error(`Tab ${tabId} is not part of browser session ${session.sessionId}`);
+      throw new Error(await this.notInSessionMessage(tabId, session.sessionId));
     }
     if (isInternalTab(tab)) {
       throw new Error(
         `Tab ${tabId} shows ${tab.url}; Chrome does not let extensions control chrome:// pages. Use another tab, or open-tab --url with a web page; finalize-tabs still closes this one.`
       );
     }
+  }
+
+  // Say why a tab is not in the session: closed, replaced, owned by another
+  // session, or simply never claimed.
+  async notInSessionMessage(tabId, sessionId) {
+    const base = `Tab ${tabId} is not part of browser session ${sessionId}`;
+    const lost = this.lostTabs.get(tabId);
+    if (lost?.reason === "replaced" && typeof lost.replacedBy === "number") {
+      return `${base}: Chrome replaced it with tab ${lost.replacedBy} (a prerender or redirect swap)${
+        lost.sessionId === sessionId ? `, which is in this session. Use --tab-id ${lost.replacedBy}.` : "."
+      }`;
+    }
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      const ago = lost ? ` ${Math.max(1, Math.round((Date.now() - lost.at) / 1000))}s ago` : "";
+      return `${base}: the tab no longer exists (closed${ago}, by the user, the page, or finalize-tabs). Run obu tabs and user-tabs to pick another.`;
+    }
+    if (typeof tab.groupId === "number" && tab.groupId !== -1) {
+      const owner = await this.store.findSessionByGroup(tab.groupId);
+      if (owner && owner.sessionId !== sessionId) {
+        return `${base}: it belongs to session ${owner.sessionId}. Take it over with: obu claim-tab --tab-id ${tabId} --force`;
+      }
+    }
+    return `${base}: it is not in the session's tab group (it was released, ungrouped, or never claimed). Claim it with: obu claim-tab --tab-id ${tabId}`;
   }
 
   async withLogicalActive(sessionId, tabs) {
@@ -1898,6 +2224,55 @@ const TAB_PAINT_DELAY_MS = 150;
 const FRAME_ATTACH_SETTLE_MS = 300;
 const FRAME_RESOLVE_WAIT_MS = 2_000;
 
+const FOREIGN_ATTACH_RETRY_DELAYS_MS = [500, 1_500, 3_000];
+const FOREIGN_ATTACH_COOLDOWN_MS = 5_000;
+const DEBUGGER_FREE_METHODS = new Set(["Runtime.evaluate", "Page.navigate", "Page.reload", "Page.captureScreenshot"]);
+
+// Chrome refuses chrome.debugger.attach while a frame from another extension
+// is in the page.
+function isForeignExtensionFrameError(error) {
+  return /chrome-extension:\/\/ URL of different extension/i.test(String(error?.message ?? error));
+}
+
+// List chrome-extension:// iframes in the tab, including ones inside open
+// shadow roots and inside frames we can script.
+async function findExtensionFrames(tabId) {
+  try {
+    const injections = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const found = [];
+        const visit = (root) => {
+          for (const el of root.querySelectorAll("*")) {
+            if ((el.tagName === "IFRAME" || el.tagName === "EMBED" || el.tagName === "OBJECT")) {
+              const src = el.src || el.data || "";
+              if (src.startsWith("chrome-extension://")) found.push(src);
+            }
+            if (el.shadowRoot) visit(el.shadowRoot);
+          }
+        };
+        visit(document);
+        return found;
+      }
+    });
+    return [...new Set(injections.flatMap((injection) => injection?.result ?? []))];
+  } catch {
+    return [];
+  }
+}
+
+function foreignFrameMessage(tabId, chromeMessage, frames) {
+  const origins = [...new Set(frames.map((src) => src.split("/").slice(0, 3).join("/")))];
+  const blocking = origins.length > 0
+    ? `Another extension's frame is in the page (${origins.join(", ")}), and Chrome will not let a debugger attach while it is there.`
+    : "Another extension's frame or popup is in or over the page, and Chrome will not let a debugger attach while it is there.";
+  return (
+    `${chromeMessage} (tab ${tabId}). ${blocking} ` +
+    "Wait for it to close or close it (usually a password manager, wallet, or sign-in prompt), then retry. " +
+    "Until then, Runtime.evaluate, Page.navigate, Page.reload, and screenshots of the active tab still work without the debugger."
+  );
+}
+
 function isInternalTab(tab) {
   return /^(chrome|chrome-untrusted|devtools):\/\//.test(tab?.url ?? tab?.pendingUrl ?? "");
 }
@@ -1918,7 +2293,9 @@ async function withTimeout(timeoutMs, fn) {
       fn(),
       new Promise((_, reject) => {
         timeout = setTimeout(() => {
-          reject(new Error(`Timed out after ${timeoutMs}ms waiting for CDP command.`));
+          reject(new Error(
+            `Timed out after ${timeoutMs}ms waiting for CDP command. Chrome may still run it, or may already have: check the page before retrying an input, navigation, or script, or it can happen twice.`
+          ));
         }, timeoutMs);
       })
     ]);
