@@ -196,7 +196,7 @@ dot；hyphen 版本 `com.ifuryst.open-computer-use.extension` 会被
   修复 registry，因此不需要重装扩展。
 - MV3 extension core handlers：`getInfo`、`createTab`、`getTabs`、
   `getUserTabs`、`getUserHistory`、`claimUserTab`、`finalizeTabs`、
-  `nameSession`、`attach`、`detach`、`executeCdp`、`moveMouse`、
+  `nameSession`、`attach`、`detach`、`executeCdp`、`getTabState`、`moveMouse`、
   `webmcp_list_tools`、`webmcp_invoke_tool`、
   `waitForFileChooser`、`setFileChooserFiles`、`waitForDownload`、
   `downloadPath`、`readClipboardText`、`writeClipboardText`、
