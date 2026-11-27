@@ -88,6 +88,12 @@ func (runner *actionRunner) runScreenshotAction(args []string) (map[string]any, 
 	}
 	out := stringFlag(args, "--out")
 	if out == "" {
+		// Run plans: screenshot page.png
+		if positionals := positionalArgs(args); len(positionals) > 0 {
+			out = positionals[0]
+		}
+	}
+	if out == "" {
 		return nil, 0, errors.New("screenshot requires --out FILE")
 	}
 	format := strings.ToLower(stringFlag(args, "--format"))
@@ -175,8 +181,10 @@ var namedKeys = map[string]struct {
 
 func parseKeyChord(spec string) (keyChord, error) {
 	parts := strings.Split(spec, "+")
-	// "ctrl++" means ctrl and the plus key.
-	if strings.HasSuffix(spec, "++") {
+	// "+" alone is the plus key; "ctrl++" means ctrl and the plus key.
+	if spec == "+" {
+		parts = []string{"+"}
+	} else if strings.HasSuffix(spec, "++") {
 		parts = append(strings.Split(strings.TrimSuffix(spec, "++"), "+"), "+")
 	}
 	chord := keyChord{}
@@ -213,9 +221,14 @@ func parseKeyChord(spec string) (keyChord, error) {
 			upper := strings.ToUpper(string(r))
 			chord.code, chord.keyCode = "Key"+upper, int(upper[0])
 			chord.key = strings.ToLower(string(r))
-			if chord.modifiers&modShift != 0 || (r >= 'A' && r <= 'Z') {
-				chord.key = upper
+			// A bare capital ("A") means shift+a, but in a shortcut such as
+			// "Ctrl+H" the capital is only how the chord was written.
+			shortcut := chord.modifiers&(modCtrl|modAlt|modMeta) != 0
+			if r >= 'A' && r <= 'Z' && !shortcut {
 				chord.modifiers |= modShift
+			}
+			if chord.modifiers&modShift != 0 {
+				chord.key = upper
 			}
 		case r >= '0' && r <= '9':
 			chord.code, chord.keyCode, chord.key = "Digit"+string(r), int(r), string(r)
@@ -238,7 +251,12 @@ func (runner *actionRunner) runKeyAction(args []string) (map[string]any, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	specs := strings.Fields(stringFlag(args, "--keys"))
+	keys := stringFlag(args, "--keys")
+	if keys == "" {
+		// Run plans: key ctrl+h, or key "Home shift+End".
+		keys = strings.Join(positionalArgs(args), " ")
+	}
+	specs := strings.Fields(keys)
 	if len(specs) == 0 {
 		return nil, 0, errors.New("key requires --keys, e.g. --keys \"ctrl+h\" or --keys \"Home shift+End\"")
 	}
@@ -287,6 +305,7 @@ const pasteScript = `((text, selector) => {
     el = document.querySelector(selector);
     if (!el) return { error: "no element matches " + JSON.stringify(selector) };
     el.focus?.();
+    doc = el.ownerDocument;
   } else {
     el = document.activeElement;
     for (;;) {
@@ -306,9 +325,16 @@ const pasteScript = `((text, selector) => {
   const data = new view.DataTransfer();
   data.setData("text/plain", text);
   const event = new view.ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true, composed: true });
+  const snapshot = () => "value" in el ? String(el.value) : el.textContent;
+  const before = snapshot();
   const notCancelled = el.dispatchEvent(event);
+  // Some handlers insert the text without calling preventDefault; the content
+  // changing counts as handled so the fallback doesn't insert it twice.
+  const changed = snapshot() !== before;
+  const root = el.getRootNode?.() || doc;
+  const focused = root.activeElement === el || el.contains(doc.activeElement);
   const describe = el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (el.isContentEditable ? "[contenteditable]" : "");
-  return { handled: !notCancelled, target: describe };
+  return { handled: !notCancelled || changed, focused, target: describe };
 })`
 
 func (runner *actionRunner) runPasteAction(args []string) (map[string]any, int, error) {
@@ -353,7 +379,11 @@ func (runner *actionRunner) runPasteAction(args []string) (map[string]any, int, 
 		return map[string]any{"result": result}, tabID, nil
 	}
 	// No page handler took the paste (a plain input or textarea), so type it
-	// into the focused element instead.
+	// into the focused element instead. Input.insertText goes to whatever has
+	// focus, so refuse when the target could not take it.
+	if focused, _ := value["focused"].(bool); !focused {
+		return nil, 0, fmt.Errorf("paste: %s ignored the paste event and cannot take focus, so the text was not typed; pass a --selector for the editable element itself", value["target"])
+	}
 	if _, err := runner.cdpCall(tabID, "Input.insertText", map[string]any{"text": text}); err != nil {
 		return nil, 0, err
 	}

@@ -135,7 +135,8 @@ open-browser-use finalize-tabs --session-id "$OBU_SESSION_ID" --keep '[]'
   focused element, through same-origin frames and open shadow roots). Editors
   that handle paste themselves, such as Google Docs or Slack, get it that way;
   otherwise the text goes in with `Input.insertText`. The result's `method`
-  says which happened.
+  says which happened. If the target ignores the event and cannot take focus,
+  `paste` fails rather than typing into whatever else is focused.
 - `click` reports `openedTabIds` and the `link` under the point. When the link
   targets a new tab but none opened, it sets `newTabMissing: true`; the page
   most likely blocked the popup, so open the link's `href` with `open-tab`.
@@ -202,17 +203,23 @@ The user keeps using the same browser while the agent works, so:
   group. To keep them out of the way, pass `open-tab --new-window` (MCP
   `open_tab` with `new_window: true`) on the session's **first** tab. The
   session then keeps its tabs in a separate unfocused window. Once the session
-  has a tab group in the user's window, `--new-window` fails.
+  has a tab group in the user's window, `--new-window` fails. Such a session
+  cannot claim tabs from the user's window, because grouping would move them
+  into the agent window; claim user tabs from a session without
+  `--new-window`.
 - Chrome does not paint background tabs. `screenshot` and other capture calls
   briefly bring the agent tab to the front of its window and then switch back,
-  so in a shared window the user sees a short flash. A separate window avoids
-  that. A minimized window cannot be captured at all; the command fails with a
-  message saying so.
-- `page-info` includes `tab.active`, `tab.windowFocused`, `tab.windowState`,
-  `tab.visibleToUser`, and `focusEmulated`. Agent tabs run with focus
-  emulation, so `document.hasFocus()` is true there, but
-  `document.visibilityState` can still read `hidden` in a background tab. Use
-  `tab.visibleToUser` to tell whether the user can see the page.
+  so in a shared window the user sees a short flash. A separate window usually
+  avoids that, but some Linux window managers focus new windows anyway, and a
+  window covered by another may not be painted. A minimized window cannot be
+  captured at all; the command fails with a message saying so.
+- `page-info` includes `tab.active`, `tab.activeInWindow`,
+  `tab.windowFocused`, `tab.windowState`, `tab.visibleToUser`, and
+  `focusEmulated`. Agent tabs run with focus emulation, so
+  `document.hasFocus()` is true there, but `document.visibilityState` can still
+  read `hidden` in a background tab. `tab.visibleToUser` means the tab is in
+  front of the focused window; `tab.activeInWindow` only means it is in front
+  of its own window, which may be behind another one.
 - `scroll` turns focus emulation on for its wheel events and restores the
   previous state afterwards (`focusEmulationRestored`).
 
@@ -223,7 +230,7 @@ The user keeps using the same browser while the agent works, so:
   interrupted, take the tab over with `claim-tab --tab-id <id> --force` (MCP
   `claim_tab` with `force: true`), or keep working in it by passing the owning
   `--session-id`.
-- When a tab is closed or Chrome replaces it (prerender, discard), commands
+- When a tab is closed or Chrome replaces it (for example after a prerender), commands
   that name the old id fail with what happened, such as "Chrome replaced it
   with tab N", instead of a bare "not in session" error.
 
@@ -233,8 +240,11 @@ Some extensions (password managers, grammar checkers) inject
 `chrome-extension://` iframes into pages, and Chrome then refuses to attach the
 debugger. Open Browser Use retries a few times and then fails with the frame it
 found. In that case `Runtime.evaluate`, `Page.navigate`, `Page.reload`, and
-`Page.captureScreenshot` (active tab only) still work without the debugger;
-their results carry `fallback: "no-debugger"`. Input events and other CDP
+`Page.captureScreenshot` (active tab only) fall back to running without the
+debugger; their results carry `fallback: "no-debugger"`. The evaluate fallback
+returns only values that survive structured cloning (no DOM nodes), awaits a
+promise only with `awaitPromise`, and on a page whose CSP forbids `eval` it
+returns the `EvalError` in `exceptionDetails`. Input events and other CDP
 methods need the debugger, so ask the user to disable that extension for the
 site.
 
