@@ -2472,7 +2472,7 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 				return true
 			}
 			session, _ := tab["sessionId"].(string)
-			return session != "" && session == runner.options.sessionID
+			return session != "" && session == runner.sessionID
 		}
 		for _, id := range runner.allTabIDs(fromClick) {
 			if !slices.Contains(before, id) {
@@ -3447,6 +3447,14 @@ func invokeWithProfile(socketPath string, socketDir string, browser string, prof
 		requestTimeout = floor
 	}
 	_ = conn.SetDeadline(time.Now().Add(requestTimeout))
+	// The extension must give up before the socket deadline, or its timeout
+	// error (or a late success) is lost behind a generic "no reply".
+	if ms, ok := params["timeoutMs"].(int); ok {
+		// A few milliseconds over still leaves most of the 500ms grace.
+		if limit := cdpTimeoutMs(requestTimeout); ms > limit+100 {
+			params["timeoutMs"] = limit
+		}
+	}
 	applySessionDefaults(params, defaultCLISessionID)
 	requestID := "cli-1"
 	request := map[string]any{
@@ -3520,7 +3528,7 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 		}
 		return retryHostDiscovery(socketDir, timeout, func(time.Duration) (net.Conn, bool, error) {
 			conn, err := dialBrowserSocket("", socketDir, timeout)
-			return conn, true, err
+			return conn, false, err
 		})
 	}
 	// When the caller pinned an explicit --socket, honour it but still verify it
@@ -3544,10 +3552,12 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 	}
 	return retryHostDiscovery(socketDir, timeout, func(probe time.Duration) (net.Conn, bool, error) {
 		conn, _, seen, busy, err := pickSocketForProfileProbeDetail(socketDir, browser, profile, timeout, probe)
-		// Hosts answered and none matched: a wrong --browser/--profile, not a
-		// restart. Retrying would only delay the error.
-		retryable := busy > 0 || len(seen) == 0
-		return conn, retryable, err
+		// Hosts answered and none matched: either a wrong --browser/--profile
+		// or the target profile's host is mid-restart (its socket is removed
+		// while it is down) while another profile's host keeps answering.
+		// Wait briefly for the second case, not most of --timeout.
+		brief := busy == 0 && len(seen) > 0
+		return conn, brief, err
 	})
 }
 
@@ -3555,24 +3565,28 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 // restarting: Chrome stops the extension's service worker, the native host
 // goes with it and comes back a few seconds later, and a busy extension can
 // miss the short getInfo probe. Nothing has been sent yet, so retrying is
-// safe. With no socket at all (browser closed, or mid-restart) it waits only
-// briefly; with a socket that exists but does not answer it uses most of the
-// timeout.
+// safe. With no socket at all (browser closed, or mid-restart), or when attempt
+// reports brief (hosts answered but none matched), it waits only
+// noSocketRetryBudget; with a socket that exists but does not answer it uses
+// most of the timeout.
 func retryHostDiscovery(socketDir string, timeout time.Duration, attempt func(probe time.Duration) (net.Conn, bool, error)) (net.Conn, error) {
 	start := time.Now()
 	budget := hostDiscoveryBudget(timeout)
 	probe := 800 * time.Millisecond
 	for {
-		conn, retryable, err := attempt(probe)
+		conn, brief, err := attempt(probe)
 		if err == nil {
 			return conn, nil
 		}
 		limit := budget
-		if candidates, _ := listSocketCandidates(socketDir); len(candidates) == 0 && limit > noSocketRetryBudget {
+		if candidates, _ := listSocketCandidates(socketDir); len(candidates) == 0 {
+			brief = true
+		}
+		if brief && limit > noSocketRetryBudget {
 			limit = noSocketRetryBudget
 		}
 		elapsed := time.Since(start)
-		if !retryable || elapsed+hostRetryDelay > limit {
+		if elapsed+hostRetryDelay > limit {
 			if elapsed < hostRetryDelay {
 				return nil, err
 			}

@@ -93,20 +93,34 @@ func startFakeHost(t *testing.T, sock string, instance string, delay time.Durati
 	})
 }
 
-// Hosts that answer but match no --profile mean a wrong selector, not a
-// restart: fail at once instead of retrying for most of --timeout.
-func TestDialMismatchFailsFast(t *testing.T) {
+// Hosts that answer but match no --profile: a wrong selector fails after a
+// short wait, not most of --timeout.
+func TestDialMismatchWaitsBriefly(t *testing.T) {
 	socketDir := t.TempDir()
 	startFakeHost(t, filepath.Join(socketDir, "a.sock"), "inst-a", 0)
 	time.Sleep(100 * time.Millisecond)
 	start := time.Now()
-	_, err := dialBrowserSocketForProfile("", socketDir, "", "inst-nope", 10*time.Second)
+	_, err := dialBrowserSocketForProfile("", socketDir, "", "inst-nope", 30*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "currently connected") {
 		t.Fatalf("want a mismatch error listing connected hosts, got %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("mismatch should not retry, took %s", elapsed)
+	if elapsed := time.Since(start); elapsed > noSocketRetryBudget+time.Second {
+		t.Fatalf("mismatch wait should stay near %s, took %s", noSocketRetryBudget, elapsed)
 	}
+}
+
+// Another profile's host keeps answering while the target profile's host
+// restarts (its socket is gone meanwhile): the CLI waits for it.
+func TestDialWaitsForRestartingProfileBesideAnother(t *testing.T) {
+	socketDir := t.TempDir()
+	startFakeHost(t, filepath.Join(socketDir, "a.sock"), "inst-a", 0)
+	startFakeHost(t, filepath.Join(socketDir, "b.sock"), "inst-b", 1500*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	conn, err := dialBrowserSocketForProfile("", socketDir, "", "inst-b", 10*time.Second)
+	if err != nil {
+		t.Fatalf("want the restarting profile to be found, got %v", err)
+	}
+	conn.Close()
 }
 
 // Without --browser/--profile the CLI also waits for a restarting host.

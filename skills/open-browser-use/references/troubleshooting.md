@@ -52,10 +52,12 @@ For a moment no host answers. The CLI retries discovery, with or without
 - A host socket exists but does not answer: up to 80% of `--timeout` (at most
   20 seconds).
 - No host socket at all (browser closed, or mid-restart): about 4 seconds.
-- Hosts answer but none matches `--browser`/`--profile`: no retry; the error
-  lists what is connected.
+- Hosts answer but none matches `--browser`/`--profile` (a wrong selector, or
+  that profile's host is restarting while another keeps running): about 4
+  seconds; the error lists what is connected.
 
-Time spent waiting comes out of `--timeout`. If it still fails, wait a few
+Time spent waiting mostly comes out of `--timeout`; the request itself always
+keeps at least a quarter of it, so a command can run slightly past the limit. If it still fails, wait a few
 seconds and run `ping` again. If the error says a host "accepted the
 connection but did not answer", the extension is busy or restarting; retrying
 usually works.
