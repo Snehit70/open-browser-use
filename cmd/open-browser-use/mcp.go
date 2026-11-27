@@ -248,17 +248,19 @@ func mcpTools() []mcpTool {
 		{
 			Name:        "open_tab",
 			Title:       "Open Browser Tab",
-			Description: "Open a new managed browser tab and optionally navigate it to a URL.",
+			Description: "Open a new managed browser tab and optionally navigate it to a URL. Pass new_window on the session's first tab to keep agent tabs in a separate unfocused window, away from the user's active tab.",
 			InputSchema: objectSchema(map[string]any{
-				"url": stringSchema("Optional URL to navigate after creating the tab."),
+				"url":        stringSchema("Optional URL to navigate after creating the tab."),
+				"new_window": booleanSchema("Open the session's tabs in a separate unfocused window. Only valid before the session's first tab."),
 			}, nil),
 		},
 		{
 			Name:        "claim_tab",
 			Title:       "Claim Existing Tab",
-			Description: "Claim an existing Chrome tab by id for the current browser session.",
+			Description: "Claim an existing Chrome tab by id for the current browser session. If another (interrupted) session owns it, pass force to take it over; user_tabs shows the owning sessionId.",
 			InputSchema: objectSchema(map[string]any{
 				"tab_id": integerSchema("Chrome tab id to claim."),
+				"force":  booleanSchema("Take the tab over from another browser session."),
 			}, []string{"tab_id"}),
 		},
 		{
@@ -415,6 +417,10 @@ func stringSchema(description string) map[string]any {
 	}
 }
 
+func booleanSchema(description string) map[string]any {
+	return map[string]any{"type": "boolean", "description": description}
+}
+
 func integerSchema(description string) map[string]any {
 	return map[string]any{
 		"type":        "integer",
@@ -476,7 +482,11 @@ func (server *mcpServer) runTool(name string, arguments map[string]any) (any, er
 		if err != nil {
 			return nil, err
 		}
-		response, _, err := server.runner.invoke("claimUserTab", map[string]any{"tabId": tabID})
+		params := map[string]any{"tabId": tabID}
+		if force, _ := arguments["force"].(bool); force {
+			params["force"] = true
+		}
+		response, _, err := server.runner.invoke("claimUserTab", params)
 		if err == nil {
 			server.runner.currentTabID = tabID
 		}
@@ -557,6 +567,9 @@ func (server *mcpServer) runHistoryTool(arguments map[string]any) (any, error) {
 
 func (server *mcpServer) runOpenTabTool(arguments map[string]any) (any, error) {
 	args := []string{}
+	if newWindow, _ := arguments["new_window"].(bool); newWindow {
+		args = append(args, "--new-window")
+	}
 	if url := optionalStringArg(arguments, "url"); url != "" {
 		args = append(args, url)
 	}

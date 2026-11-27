@@ -1503,7 +1503,7 @@ func TestCobraRunActionPlan(t *testing.T) {
 		defer close(requests)
 		var sessionID string
 		var turnID string
-		for count := 0; count < 10; count++ {
+		for count := 0; count < 11; count++ {
 			conn, err := listener.Accept()
 			if err != nil {
 				serverDone <- err
@@ -1619,6 +1619,7 @@ finalize-tabs []
 		"executeCdp:Runtime.evaluate",
 		"attach",
 		"executeCdp:Runtime.evaluate",
+		"getTabState",
 		"finalizeTabs",
 	}
 	if strings.Join(methods, ",") != strings.Join(want, ",") {
