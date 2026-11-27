@@ -127,6 +127,8 @@ function createChromeFake() {
         state.lastScript = details;
         const next = state.scriptResults.shift();
         if (next instanceof Error) throw next;
+        // "run" executes the injected function for real, as Chrome would.
+        if (next === "run") return [{ result: await details.func(...(details.args ?? [])) }];
         return next ?? [{ result: undefined }];
       }
     },
@@ -305,13 +307,37 @@ async function run() {
 
     // Runtime.evaluate falls back to chrome.scripting.
     state.attachErrors.push(refusal);
-    state.scriptResults.push([{ result: [] }], [{ result: { ok: 2 } }]);
+    state.scriptResults.push([{ result: [] }], "run");
     const result = await backend.executeCdp(
       params("s", { target: { tabId }, method: "Runtime.evaluate", commandParams: { expression: "({ok: 1+1})" } })
     );
-    assert.deepEqual({ ...result.result }, { type: "object", value: { ok: 2 } });
+    assert.deepEqual(JSON.parse(JSON.stringify(result.result)), { type: "object", value: { ok: 2 } });
     assert.equal(result.fallback, "no-debugger");
     assert.equal(state.lastScript.world, "MAIN");
+
+    // A throw (or a CSP EvalError) comes back as exceptionDetails, not as an
+    // empty undefined result.
+    state.attachErrors.push(refusal);
+    state.scriptResults.push([{ result: [] }], "run");
+    const thrown = await backend.executeCdp(
+      params("s", { target: { tabId }, method: "Runtime.evaluate", commandParams: { expression: "throw new TypeError('boom')" } })
+    );
+    assert.equal(thrown.exceptionDetails?.text, "Uncaught");
+    assert.match(thrown.result.description, /TypeError: boom/);
+
+    // A promise is awaited only with awaitPromise, like Runtime.evaluate.
+    state.attachErrors.push(refusal);
+    state.scriptResults.push([{ result: [] }], "run");
+    const pending = await backend.executeCdp(
+      params("s", { target: { tabId }, method: "Runtime.evaluate", commandParams: { expression: "Promise.resolve(5)" } })
+    );
+    assert.equal(pending.result.subtype, "promise");
+    state.attachErrors.push(refusal);
+    state.scriptResults.push([{ result: [] }], "run");
+    const awaited = await backend.executeCdp(
+      params("s", { target: { tabId }, method: "Runtime.evaluate", commandParams: { expression: "Promise.resolve(5)", awaitPromise: true } })
+    );
+    assert.equal(awaited.result.value, 5);
     console.log("ok: foreign-extension attach retries, names the frame, and falls back");
   }
 
@@ -353,20 +379,65 @@ async function run() {
     );
     assert.equal((await backend.getTabState(params("s", { tabId: userTab }))).focusEmulated, false);
     assert.ok(state.sent.some((cmd) => cmd.method === "Emulation.setFocusEmulationEnabled" && cmd.params.enabled === false));
+
+    // Detaching ends the emulation, so the report must not keep claiming it.
+    await backend.detachTab(agentTab);
+    tabState = await backend.getTabState(params("s", { tabId: agentTab }));
+    assert.equal(tabState.focusEmulated, false);
+    assert.equal(tabState.debuggerAttached, false);
+
+    // Active in an unfocused window is in front there, not seen by the user.
+    state.windows.set(1, { id: 1, focused: false, state: "normal" });
+    tabState = await backend.getTabState(params("s", { tabId: userTab }));
+    assert.equal(tabState.activeInWindow, true);
+    assert.equal(tabState.visibleToUser, false);
     console.log("ok: focus emulation state is tracked and reported");
   }
 
-  // A tab spawned by a session tab outside its group is pulled into the group.
+  // A tab spawned by a session tab outside its group is pulled into the group:
+  // always for agent tabs, and for a claimed user tab only right after agent
+  // input. A tab the user opens from their own claimed tab stays theirs.
   {
     const { backend, state, events, addTab } = await loadBackend();
     const opener = addTab();
     await backend.claimUserTab(params("s", { tabId: opener }));
-    const spawned = addTab({ openerTabId: opener, groupId: -1 });
-    events.onCreated.fire({ ...state.tabs.get(spawned) });
+    const byUser = addTab({ openerTabId: opener, groupId: -1 });
+    events.onCreated.fire({ ...state.tabs.get(byUser) });
     await settle();
-    assert.equal(state.tabs.get(spawned).groupId, backend.store.state.sessions.s.chromeGroupId);
-    assert.equal(backend.store.state.sessions.s.tabOrigins[String(spawned)], "agent");
-    console.log("ok: spawned tabs outside the group join the session");
+    assert.equal(state.tabs.get(byUser).groupId, -1);
+    assert.equal(backend.store.state.sessions.s.tabOrigins[String(byUser)], undefined);
+
+    await backend.ensureAttached(opener);
+    await backend.executeCdp(
+      params("s", { target: { tabId: opener }, method: "Input.dispatchMouseEvent", commandParams: { type: "mousePressed", x: 1, y: 1 } })
+    );
+    const byAgent = addTab({ openerTabId: opener, groupId: -1 });
+    events.onCreated.fire({ ...state.tabs.get(byAgent) });
+    await settle();
+    assert.equal(state.tabs.get(byAgent).groupId, backend.store.state.sessions.s.chromeGroupId);
+    assert.equal(backend.store.state.sessions.s.tabOrigins[String(byAgent)], "agent");
+
+    const agentOpener = addTab();
+    await backend.claimUserTab(params("s", { tabId: agentOpener }));
+    backend.store.state.sessions.s.tabOrigins[String(agentOpener)] = "agent";
+    const fromAgentTab = addTab({ openerTabId: agentOpener, groupId: -1 });
+    events.onCreated.fire({ ...state.tabs.get(fromAgentTab) });
+    await settle();
+    assert.equal(state.tabs.get(fromAgentTab).groupId, backend.store.state.sessions.s.chromeGroupId);
+    console.log("ok: spawned tabs join the session only when the agent opened them");
+  }
+
+  // A --new-window session refuses to claim a tab from the user's window,
+  // since grouping would move it into the agent window.
+  {
+    const { backend, state, addTab } = await loadBackend();
+    state.windows.set(9, { id: 9, focused: false, state: "normal" });
+    const agentTab = addTab({ windowId: 9 });
+    await backend.claimUserTab(params("s", { tabId: agentTab }));
+    backend.store.state.sessions.s.agentWindowId = 9;
+    const userTab = addTab({ windowId: 1 });
+    await assert.rejects(backend.claimUserTab(params("s", { tabId: userTab })), /separate window/);
+    console.log("ok: claim refuses to move a user tab into the agent window");
   }
 
   // Screenshots in a minimized window fail with a reason instead of hanging.

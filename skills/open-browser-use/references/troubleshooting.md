@@ -46,11 +46,21 @@ If no active host exists, opening Chrome with the extension enabled can allow Ch
 ## "No Chrome host was reachable" In The Middle Of A Task
 
 Chrome stops an idle MV3 service worker, and the native host restarts with it.
-For a moment no host answers. The CLI keeps retrying discovery for up to 80% of
-`--timeout` (at most 20 seconds) before it gives up, and the error then says how
-long it retried. If it still fails, wait a few seconds and run `ping` again. If
-the error says a host "accepted the connection but did not answer", the
-extension is busy or restarting; retrying usually works.
+For a moment no host answers. The CLI retries discovery, with or without
+`--browser`/`--profile`, and the error then says how long it retried:
+
+- A host socket exists but does not answer: up to 80% of `--timeout` (at most
+  20 seconds).
+- No host socket at all (browser closed, or mid-restart): about 4 seconds.
+- Hosts answer but none matches `--browser`/`--profile` (a wrong selector, or
+  that profile's host is restarting while another keeps running): about 4
+  seconds; the error lists what is connected.
+
+Time spent waiting mostly comes out of `--timeout`; the request itself always
+keeps at least a quarter of it, so a command can run slightly past the limit. If it still fails, wait a few
+seconds and run `ping` again. If the error says a host "accepted the
+connection but did not answer", the extension is busy or restarting; retrying
+usually works.
 
 ## Timeouts On Input Commands
 
@@ -86,6 +96,8 @@ For five seconds after that it fails fast instead of retrying again.
 - "...must come before the session's first tab": `open-tab --new-window` only
   works before the session has a tab group in the user's window. Start a new
   session id to get a separate window.
+- "keeps its tabs in a separate window": a `--new-window` session cannot claim
+  a tab from the user's window. Use another session id for that tab.
 
 ## Extension Or Native Host Mismatch
 

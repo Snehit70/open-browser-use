@@ -2437,7 +2437,7 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 	}
 	// Diff every tab, not just the session's: a tab a link opens can land
 	// outside the session group (another window, the end of the strip).
-	before := runner.allTabIDs()
+	before := runner.allTabIDs(nil)
 	x, y := target["x"], target["y"]
 	link := runner.linkAt(tabID, x, y)
 	if _, err := cdp("Input.dispatchMouseEvent", map[string]any{"type": "mouseMoved", "x": x, "y": y}); err != nil {
@@ -2465,7 +2465,16 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 	time.Sleep(clickSettleDelay)
 	var opened []int
 	if before != nil {
-		for _, id := range runner.allTabIDs() {
+		// Keep only tabs this tab opened or that joined the session, so a tab
+		// the user opened meanwhile is not reported as the click's.
+		fromClick := func(tab map[string]any) bool {
+			if opener, ok := numberAsInt(tab["openerTabId"]); ok && opener == tabID {
+				return true
+			}
+			session, _ := tab["sessionId"].(string)
+			return session != "" && session == runner.sessionID
+		}
+		for _, id := range runner.allTabIDs(fromClick) {
 			if !slices.Contains(before, id) {
 				opened = append(opened, id)
 			}
@@ -2474,15 +2483,19 @@ func (runner *actionRunner) runClickAction(args []string) (map[string]any, int, 
 	if len(opened) > 0 {
 		target["openedTabIds"] = opened
 	}
+	var warnings []string
 	if link != nil {
 		target["link"] = link
 		if linkOpensNewTab(link) && len(opened) == 0 && before != nil {
 			target["newTabMissing"] = true
-			target["warning"] = "the link opens a new tab, but none appeared; Chrome may have blocked it as a popup, or the page cancelled the click. open-tab --url with link.href opens it directly (a one-time sign-in link may need a fresh click instead)"
+			warnings = append(warnings, "the link opens a new tab, but none appeared; Chrome may have blocked it as a popup, or the page cancelled the click. open-tab --url with link.href opens it directly (a one-time sign-in link may need a fresh click instead)")
 		}
 	}
 	if _, ok := target["obscuredBy"]; ok {
-		target["warning"] = "another element covers the target (a dialog, overlay, or preview?); take a screenshot to check"
+		warnings = append(warnings, "another element covers the target (a dialog, overlay, or preview?); take a screenshot to check")
+	}
+	if len(warnings) > 0 {
+		target["warning"] = strings.Join(warnings, "; ")
 	}
 	return map[string]any{"result": target}, tabID, nil
 }
@@ -2501,7 +2514,9 @@ const linkAtPointScript = `((x, y) => {
   let node = el;
   while (node) {
     if (node.tagName === "A" && node.href) {
-      return { href: node.href, target: node.target || "", rel: node.rel || "" };
+      // An empty target falls back to <base target>.
+      const base = node.ownerDocument.querySelector("base[target]");
+      return { href: node.href, target: node.target || base?.target || "", rel: node.rel || "" };
     }
     const root = node.getRootNode();
     node = node.parentElement || (root instanceof ShadowRoot ? root.host : null);
@@ -2530,17 +2545,16 @@ func (runner *actionRunner) linkAt(tabID int, x, y any) map[string]any {
 	return link
 }
 
+// linkOpensNewTab reports links that always open a new tab. A named target
+// can reuse a window that already exists, so it is not counted.
 func linkOpensNewTab(link map[string]any) bool {
 	target, _ := link["target"].(string)
-	switch strings.ToLower(target) {
-	case "", "_self", "_parent", "_top":
-		return false
-	}
-	return true
+	return strings.EqualFold(target, "_blank")
 }
 
-// allTabIDs lists every tab in the profile, or nil if that fails.
-func (runner *actionRunner) allTabIDs() []int {
+// allTabIDs lists every tab in the profile that keep accepts (all when keep is
+// nil), or nil if listing fails.
+func (runner *actionRunner) allTabIDs(keep func(tab map[string]any) bool) []int {
 	response, _, err := runner.invoke("getUserTabs", map[string]any{})
 	if err != nil || rpcError(response) != nil {
 		return nil
@@ -2549,6 +2563,9 @@ func (runner *actionRunner) allTabIDs() []int {
 	ids := []int{}
 	for _, raw := range tabs {
 		if tab, ok := raw.(map[string]any); ok {
+			if keep != nil && !keep(tab) {
+				continue
+			}
 			if id, ok := numberAsInt(tab["id"]); ok {
 				ids = append(ids, id)
 			}
@@ -2994,7 +3011,7 @@ func cdpResultValue(response map[string]any) map[string]any {
 
 func tabStateSummary(state map[string]any) map[string]any {
 	out := map[string]any{}
-	for _, key := range []string{"active", "windowFocused", "windowState", "visibleToUser"} {
+	for _, key := range []string{"active", "activeInWindow", "windowFocused", "windowState", "visibleToUser"} {
 		if value, ok := state[key]; ok {
 			out[key] = value
 		}
@@ -3416,12 +3433,28 @@ func invoke(socketPath string, socketDir string, method string, params map[strin
 }
 
 func invokeWithProfile(socketPath string, socketDir string, browser string, profile string, method string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	start := time.Now()
 	conn, err := dialBrowserSocketForProfile(socketPath, socketDir, browser, profile, timeout)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	// Time spent waiting for the host comes out of --timeout, so a command
+	// stays close to the limit the caller asked for. The request always keeps
+	// a quarter of it.
+	requestTimeout := timeout - time.Since(start)
+	if floor := timeout / 4; requestTimeout < floor {
+		requestTimeout = floor
+	}
+	_ = conn.SetDeadline(time.Now().Add(requestTimeout))
+	// The extension must give up before the socket deadline, or its timeout
+	// error (or a late success) is lost behind a generic "no reply".
+	if ms, ok := params["timeoutMs"].(int); ok {
+		// A few milliseconds over still leaves most of the 500ms grace.
+		if limit := cdpTimeoutMs(requestTimeout); ms > limit+100 {
+			params["timeoutMs"] = limit
+		}
+	}
 	applySessionDefaults(params, defaultCLISessionID)
 	requestID := "cli-1"
 	request := map[string]any{
@@ -3436,7 +3469,7 @@ func invokeWithProfile(socketPath string, socketDir string, browser string, prof
 	response, err := readResponseForID(conn, requestID)
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return nil, fmt.Errorf("no reply from the browser to %s within %s; the page or browser may be busy (first call after the browser wakes can be slow). %s", method, timeout, timeoutRetryHint(method, params))
+		return nil, fmt.Errorf("no reply from the browser to %s within %s; the page or browser may be busy (first call after the browser wakes can be slow). %s", method, time.Since(start).Round(100*time.Millisecond), timeoutRetryHint(method, params))
 	}
 	return response, err
 }
@@ -3490,7 +3523,13 @@ func applySessionDefaults(params map[string]any, sessionID string) {
 
 func dialBrowserSocketForProfile(socketPath string, socketDir string, browser string, profile string, timeout time.Duration) (net.Conn, error) {
 	if strings.TrimSpace(browser) == "" && strings.TrimSpace(profile) == "" {
-		return dialBrowserSocket(socketPath, socketDir, timeout)
+		if socketPath != "" {
+			return dialBrowserSocket(socketPath, socketDir, timeout)
+		}
+		return retryHostDiscovery(socketDir, timeout, func(time.Duration) (net.Conn, bool, error) {
+			conn, err := dialBrowserSocket("", socketDir, timeout)
+			return conn, false, err
+		})
 	}
 	// When the caller pinned an explicit --socket, honour it but still verify it
 	// is the right browser/profile. This protects the user from accidentally
@@ -3511,18 +3550,47 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 		}
 		return conn, nil
 	}
-	// The host goes away while Chrome restarts the extension's service worker
-	// and comes back a few seconds later; a busy extension can also miss the
-	// short getInfo probe. Nothing has been sent yet, so retrying is safe.
-	deadline := time.Now().Add(hostDiscoveryBudget(timeout))
+	return retryHostDiscovery(socketDir, timeout, func(probe time.Duration) (net.Conn, bool, error) {
+		conn, _, seen, busy, err := pickSocketForProfileProbeDetail(socketDir, browser, profile, timeout, probe)
+		// Hosts answered and none matched: either a wrong --browser/--profile
+		// or the target profile's host is mid-restart (its socket is removed
+		// while it is down) while another profile's host keeps answering.
+		// Wait briefly for the second case, not most of --timeout.
+		brief := busy == 0 && len(seen) > 0
+		return conn, brief, err
+	})
+}
+
+// retryHostDiscovery retries attempt while the host looks like it is
+// restarting: Chrome stops the extension's service worker, the native host
+// goes with it and comes back a few seconds later, and a busy extension can
+// miss the short getInfo probe. Nothing has been sent yet, so retrying is
+// safe. With no socket at all (browser closed, or mid-restart), or when attempt
+// reports brief (hosts answered but none matched), it waits only
+// noSocketRetryBudget; with a socket that exists but does not answer it uses
+// most of the timeout.
+func retryHostDiscovery(socketDir string, timeout time.Duration, attempt func(probe time.Duration) (net.Conn, bool, error)) (net.Conn, error) {
+	start := time.Now()
+	budget := hostDiscoveryBudget(timeout)
 	probe := 800 * time.Millisecond
 	for {
-		conn, _, _, err := pickSocketForProfileProbe(socketDir, browser, profile, timeout, probe)
+		conn, brief, err := attempt(probe)
 		if err == nil {
 			return conn, nil
 		}
-		if time.Now().Add(hostRetryDelay).After(deadline) {
-			return nil, fmt.Errorf("%w (kept retrying for %s; the extension may be restarting, so retry in a few seconds or pass a longer --timeout)", err, hostDiscoveryBudget(timeout).Round(time.Second))
+		limit := budget
+		if candidates, _ := listSocketCandidates(socketDir); len(candidates) == 0 {
+			brief = true
+		}
+		if brief && limit > noSocketRetryBudget {
+			limit = noSocketRetryBudget
+		}
+		elapsed := time.Since(start)
+		if elapsed+hostRetryDelay > limit {
+			if elapsed < hostRetryDelay {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w (kept retrying for %s; the extension may be restarting, so retry in a few seconds or pass a longer --timeout)", err, elapsed.Round(100*time.Millisecond))
 		}
 		time.Sleep(hostRetryDelay)
 		if probe < 2*time.Second {
@@ -3530,6 +3598,10 @@ func dialBrowserSocketForProfile(socketPath string, socketDir string, browser st
 		}
 	}
 }
+
+// noSocketRetryBudget bounds the wait when no host socket exists at all, so a
+// closed browser fails in a few seconds instead of most of --timeout.
+const noSocketRetryBudget = 4 * time.Second
 
 const hostRetryDelay = 500 * time.Millisecond
 
@@ -3708,12 +3780,19 @@ func pickSocketForProfile(socketDir string, browserSelector string, profileSelec
 }
 
 func pickSocketForProfileProbe(socketDir string, browserSelector string, profileSelector string, timeout time.Duration, maxProbe time.Duration) (net.Conn, connectedProfileInfo, []connectedProfileInfo, error) {
+	conn, info, seen, _, err := pickSocketForProfileProbeDetail(socketDir, browserSelector, profileSelector, timeout, maxProbe)
+	return conn, info, seen, err
+}
+
+// pickSocketForProfileProbeDetail also reports how many hosts accepted the
+// connection but did not answer the probe in time.
+func pickSocketForProfileProbeDetail(socketDir string, browserSelector string, profileSelector string, timeout time.Duration, maxProbe time.Duration) (net.Conn, connectedProfileInfo, []connectedProfileInfo, int, error) {
 	candidates, err := listSocketCandidates(socketDir)
 	if err != nil {
-		return nil, connectedProfileInfo{}, nil, err
+		return nil, connectedProfileInfo{}, nil, 0, err
 	}
 	if len(candidates) == 0 {
-		return nil, connectedProfileInfo{}, nil, fmt.Errorf("no Open Browser Use socket found; open Chrome with the desired profile (`open-browser-use profiles` lists installed profiles)")
+		return nil, connectedProfileInfo{}, nil, 0, fmt.Errorf("no Open Browser Use socket found; open Chrome with the desired profile (`open-browser-use profiles` lists installed profiles)")
 	}
 	probeTimeout := timeout
 	if probeTimeout > maxProbe {
@@ -3737,7 +3816,7 @@ func pickSocketForProfileProbe(socketDir string, browserSelector string, profile
 		seen = append(seen, info)
 		if browserSelectorMatches(browserSelector, info) && profileSelectorMatches(profileSelector, info) {
 			repairActiveSocketRecord(socketDir, candidate)
-			return conn, info, seen, nil
+			return conn, info, seen, busy, nil
 		}
 		_ = conn.Close()
 	}
@@ -3745,7 +3824,7 @@ func pickSocketForProfileProbe(socketDir string, browserSelector string, profile
 	if busy > 0 {
 		hint += fmt.Sprintf("; %d host(s) accepted the connection but did not answer within %s (busy or restarting)", busy, probeTimeout)
 	}
-	return nil, connectedProfileInfo{}, seen, fmt.Errorf("no running Open Browser Use host matched --browser %q --profile %q; %s", browserSelector, profileSelector, hint)
+	return nil, connectedProfileInfo{}, seen, busy, fmt.Errorf("no running Open Browser Use host matched --browser %q --profile %q; %s", browserSelector, profileSelector, hint)
 }
 
 func profileMatchHint(seen []connectedProfileInfo) string {

@@ -323,6 +323,7 @@ class BrowserBackend {
     // Tabs where this extension turned Emulation.setFocusEmulationEnabled on,
     // so page-info and scroll can say what the page's visibilityState means.
     this.focusEmulatedTabs = new Set();
+    this.lastAgentInputAt = new Map();
     // tabId -> { reason, sessionId, at, replacedBy? } for session tabs that
     // were closed or replaced, so a later "not part of session" error can say
     // what happened instead of leaving the agent guessing.
@@ -370,7 +371,14 @@ class BrowserBackend {
       return;
     }
     const owner = await this.store.findSessionByGroup(opener.groupId);
-    if (!owner || !owner.session.tabOrigins?.[String(opener.id)]) {
+    const openerOrigin = owner?.session.tabOrigins?.[String(opener.id)];
+    if (!openerOrigin) {
+      return;
+    }
+    // A tab claimed from the user is still the user's to use: a tab they open
+    // from it (shift+click, middle click) is theirs. Count it as the agent's
+    // only when the agent sent input to the opener just before.
+    if (openerOrigin !== "agent" && !this.agentDroveTabRecently(opener.id)) {
       return;
     }
     owner.session.tabOrigins[String(tab.id)] ??= "agent";
@@ -383,10 +391,16 @@ class BrowserBackend {
     }
   }
 
+  agentDroveTabRecently(tabId) {
+    const at = this.lastAgentInputAt.get(tabId);
+    return typeof at === "number" && Date.now() - at < AGENT_INPUT_SPAWN_WINDOW_MS;
+  }
+
   // A session tab closed: drop it from its session and remember why, for
   // requireSessionTab's error.
   async forgetTab(tabId, { reason, replacedBy } = {}) {
     await this.store.ready;
+    this.lastAgentInputAt.delete(tabId);
     this.attachedTabs.delete(tabId);
     this.focusEmulatedTabs.delete(tabId);
     this.foreignAttachFailures.delete(tabId);
@@ -526,7 +540,11 @@ class BrowserBackend {
     return tabs.map((tab) => {
       const userTab = toUserTab(tab, groupTitles);
       const owner = groupSessions.get(tab.groupId);
-      return owner ? { ...userTab, sessionId: owner } : userTab;
+      return {
+        ...userTab,
+        ...(typeof tab.openerTabId === "number" ? { openerTabId: tab.openerTabId } : {}),
+        ...(owner ? { sessionId: owner } : {})
+      };
     });
   }
 
@@ -597,6 +615,19 @@ class BrowserBackend {
       throw new Error(
         `Tab ${tabId} shows ${tab.url}; Chrome does not let extensions control chrome:// pages. Open the page in a new tab with open-tab --url if it has a web equivalent.`
       );
+    }
+    // A --new-window session keeps its group in the agent window, and
+    // grouping a tab moves it into the group's window: the user's tab would
+    // vanish from their window.
+    const sessionState = this.store.state.sessions?.[session.sessionId];
+    if (typeof sessionState?.agentWindowId === "number" && tab.windowId !== sessionState.agentWindowId) {
+      const agentWindow = await chrome.windows.get(sessionState.agentWindowId).catch(() => null);
+      if (agentWindow) {
+        throw new Error(
+          `Session ${session.sessionId} keeps its tabs in a separate window, and claiming tab ${tabId} would move it out of the user's window. ` +
+            `Claim it from a session that did not use open-tab --new-window, or open its URL with open-tab --url.`
+        );
+      }
     }
     let origin = "user";
     if (typeof tab.groupId === "number" && tab.groupId !== -1) {
@@ -828,7 +859,11 @@ class BrowserBackend {
       windowId: tab.windowId ?? null,
       windowFocused: win?.focused === true,
       windowState: win?.state ?? null,
-      visibleToUser: tab.active === true && win?.state !== "minimized",
+      // In front of its window. Not proof the user sees it: another window
+      // can cover an unfocused one.
+      activeInWindow: tab.active === true && !!win && win.state !== "minimized",
+      // The user is looking at it: active in the focused, non-minimized window.
+      visibleToUser: tab.active === true && win?.focused === true && win.state !== "minimized",
       focusEmulated: this.focusEmulatedTabs.has(tabId),
       agentTab: this.isAgentTab(tabId),
       debuggerAttached: this.attachedTabs.has(tabId),
@@ -957,6 +992,10 @@ class BrowserBackend {
         : DEFAULT_CDP_TIMEOUT_MS;
     if (typeof tabId === "number") {
       await this.requireSessionTab({ ...params, tabId }, "executeCdp");
+      if (typeof params.method === "string" && params.method.startsWith("Input.")) {
+        // A tab this input opens is the agent's (recordSpawnedTab).
+        this.lastAgentInputAt.set(tabId, Date.now());
+      }
       try {
         await this.ensureAttached(tabId);
       } catch (error) {
@@ -1055,17 +1094,47 @@ class BrowserBackend {
           [injection] = await chrome.scripting.executeScript({
             target: { tabId },
             world: "MAIN",
-            args: [commandParams.expression],
-            // Indirect eval runs in global scope like Runtime.evaluate. A page
-            // CSP without 'unsafe-eval' blocks it; that error is returned.
-            func: (expression) => (0, eval)(expression)
+            args: [commandParams.expression, commandParams.awaitPromise === true],
+            // Indirect eval runs in global scope like Runtime.evaluate. Errors
+            // are caught here because executeScript turns a throw into an
+            // undefined result. A page CSP without 'unsafe-eval' throws an
+            // EvalError, which comes back the same way.
+            func: async (expression, awaitPromise) => {
+              try {
+                let value = (0, eval)(expression);
+                if (value && typeof value.then === "function") {
+                  if (!awaitPromise) return { promise: true };
+                  value = await value;
+                }
+                return { ok: true, value };
+              } catch (error) {
+                return { error: String(error?.stack || error) };
+              }
+            }
           });
         } catch (error) {
           throw new Error(`${fallback.reason} The scripting fallback failed too: ${String(error?.message ?? error)}`);
         }
-        const value = injection?.result;
+        const outcome = injection?.result;
+        if (!outcome || typeof outcome !== "object") {
+          throw new Error(`${fallback.reason} The scripting fallback returned nothing; the frame may have navigated.`);
+        }
+        if (typeof outcome.error === "string") {
+          const exception = { type: "object", subtype: "error", description: outcome.error };
+          return {
+            result: exception,
+            exceptionDetails: { exceptionId: 0, text: "Uncaught", lineNumber: 0, columnNumber: 0, exception },
+            ...fallback
+          };
+        }
+        if (outcome.promise) {
+          return { result: { type: "object", subtype: "promise", className: "Promise", description: "Promise" }, ...fallback };
+        }
+        // Without the debugger only values that survive structured cloning
+        // come back, as if returnByValue were set.
+        const value = outcome.value;
         return {
-          result: value === undefined ? { type: "undefined" } : { type: value === null ? "object" : typeof value, value },
+          result: value === undefined ? { type: "undefined" } : { type: value === null ? "object" : typeof value, ...(value === null ? { subtype: "null" } : {}), value },
           ...fallback
         };
       }
@@ -1964,6 +2033,8 @@ class BrowserBackend {
       await chrome.debugger.detach({ tabId });
     } finally {
       this.attachedTabs.delete(tabId);
+      // Detaching the debugger ends its emulation overrides.
+      this.focusEmulatedTabs.delete(tabId);
       this.framesByTabId.delete(tabId);
       for (const [fileChooserId, chooser] of this.fileChoosersById) {
         if (chooser.tabId === tabId) {
@@ -2226,6 +2297,9 @@ const FRAME_RESOLVE_WAIT_MS = 2_000;
 
 const FOREIGN_ATTACH_RETRY_DELAYS_MS = [500, 1_500, 3_000];
 const FOREIGN_ATTACH_COOLDOWN_MS = 5_000;
+// How long after agent input a tab opened from a claimed user tab still
+// counts as opened by the agent.
+const AGENT_INPUT_SPAWN_WINDOW_MS = 5_000;
 const DEBUGGER_FREE_METHODS = new Set(["Runtime.evaluate", "Page.navigate", "Page.reload", "Page.captureScreenshot"]);
 
 // Chrome refuses chrome.debugger.attach while a frame from another extension

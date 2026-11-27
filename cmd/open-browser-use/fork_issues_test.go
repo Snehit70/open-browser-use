@@ -50,6 +50,103 @@ func TestDialRetriesUntilHostAppears(t *testing.T) {
 	conn.Close()
 }
 
+// startFakeHost answers getInfo on sock after delay, as instance.
+func startFakeHost(t *testing.T, sock string, instance string, delay time.Duration) {
+	t.Helper()
+	ready := make(chan net.Listener, 1)
+	go func() {
+		time.Sleep(delay)
+		listener, err := net.Listen("unix", sock)
+		if err != nil {
+			ready <- nil
+			return
+		}
+		ready <- listener
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				var request map[string]any
+				if err := wire.ReadJSON(conn, &request); err != nil {
+					return
+				}
+				_ = wire.WriteJSON(conn, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request["id"],
+					"result":  map[string]any{"metadata": map[string]any{"extensionInstanceId": instance}},
+				})
+				time.Sleep(200 * time.Millisecond)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case listener := <-ready:
+			if listener != nil {
+				listener.Close()
+			}
+		case <-time.After(2 * time.Second):
+		}
+	})
+}
+
+// Hosts that answer but match no --profile: a wrong selector fails after a
+// short wait, not most of --timeout.
+func TestDialMismatchWaitsBriefly(t *testing.T) {
+	socketDir := t.TempDir()
+	startFakeHost(t, filepath.Join(socketDir, "a.sock"), "inst-a", 0)
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	_, err := dialBrowserSocketForProfile("", socketDir, "", "inst-nope", 30*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "currently connected") {
+		t.Fatalf("want a mismatch error listing connected hosts, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > noSocketRetryBudget+time.Second {
+		t.Fatalf("mismatch wait should stay near %s, took %s", noSocketRetryBudget, elapsed)
+	}
+}
+
+// Another profile's host keeps answering while the target profile's host
+// restarts (its socket is gone meanwhile): the CLI waits for it.
+func TestDialWaitsForRestartingProfileBesideAnother(t *testing.T) {
+	socketDir := t.TempDir()
+	startFakeHost(t, filepath.Join(socketDir, "a.sock"), "inst-a", 0)
+	startFakeHost(t, filepath.Join(socketDir, "b.sock"), "inst-b", 1500*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	conn, err := dialBrowserSocketForProfile("", socketDir, "", "inst-b", 10*time.Second)
+	if err != nil {
+		t.Fatalf("want the restarting profile to be found, got %v", err)
+	}
+	conn.Close()
+}
+
+// Without --browser/--profile the CLI also waits for a restarting host.
+func TestDialDefaultPathRetries(t *testing.T) {
+	socketDir := t.TempDir()
+	startFakeHost(t, filepath.Join(socketDir, "late.sock"), "inst-late", 700*time.Millisecond)
+	conn, err := dialBrowserSocketForProfile("", socketDir, "", "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("want the late host to be found on the default path, got %v", err)
+	}
+	conn.Close()
+}
+
+// A closed browser (no socket at all) fails within a few seconds even with a
+// long --timeout.
+func TestDialNoSocketWaitsBriefly(t *testing.T) {
+	start := time.Now()
+	_, err := dialBrowserSocketForProfile("", t.TempDir(), "", "nobody", 30*time.Second)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if elapsed := time.Since(start); elapsed > noSocketRetryBudget+time.Second {
+		t.Fatalf("no-socket wait should stay near %s, took %s", noSocketRetryBudget, elapsed)
+	}
+}
+
 func TestDialGivesUpWithinBudget(t *testing.T) {
 	start := time.Now()
 	_, err := dialBrowserSocketForProfile("", t.TempDir(), "", "nobody", time.Second)
@@ -88,6 +185,10 @@ func TestParseKeyChord(t *testing.T) {
 		{"Enter", "Enter", "Enter", 13, 0, "\r"},
 		{"F5", "F5", "F5", 116, 0, ""},
 		{"ctrl++", "+", "", 0, modCtrl, ""},
+		{"+", "+", "", 0, 0, "+"},
+		{"Ctrl+H", "h", "KeyH", 72, modCtrl, ""},
+		{"ctrl+A", "a", "KeyA", 65, modCtrl, ""},
+		{"Ctrl+Shift+Z", "Z", "KeyZ", 90, modCtrl | modShift, ""},
 	}
 	for _, c := range cases {
 		got, err := parseKeyChord(c.spec)
@@ -113,7 +214,7 @@ func TestWithoutArgsKeepsPositionals(t *testing.T) {
 }
 
 func TestLinkOpensNewTab(t *testing.T) {
-	for target, want := range map[string]bool{"": false, "_self": false, "_top": false, "_blank": true, "preview": true} {
+	for target, want := range map[string]bool{"": false, "_self": false, "_top": false, "_blank": true, "_BLANK": true, "preview": false} {
 		if got := linkOpensNewTab(map[string]any{"target": target}); got != want {
 			t.Fatalf("target %q: got %v", target, got)
 		}
